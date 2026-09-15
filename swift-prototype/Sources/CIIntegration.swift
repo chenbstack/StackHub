@@ -15,8 +15,11 @@ final class KeychainVault {
     private init() {}
 
     func save(token: String, account: String) throws {
+        try save(data: Data(token.utf8), account: account)
+    }
+
+    func save(data: Data, account: String) throws {
         try withLock {
-            let data = Data(token.utf8)
             let query: [String: Any] = [
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: service,
@@ -30,6 +33,11 @@ final class KeychainVault {
     }
 
     func read(account: String) -> String? {
+        guard let data = readData(account: account) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    func readData(account: String) -> Data? {
         withLock {
             let query: [String: Any] = [
                 kSecClass as String: kSecClassGenericPassword,
@@ -43,8 +51,7 @@ final class KeychainVault {
                   let result,
                   CFGetTypeID(result) == CFDataGetTypeID() else { return nil }
             // Copy the framework-owned buffer before releasing the CF result.
-            let data = Data(result as! CFData as Data)
-            return String(data: data, encoding: .utf8)
+            return Data(result as! CFData as Data)
         }
     }
 

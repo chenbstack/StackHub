@@ -1,32 +1,6 @@
 import AppKit
 import SwiftUI
 
-// Settings is deliberately an in-panel destination.  MenuBarExtra can dismiss its
-// window whenever focus changes, so project and credential editing live in these
-// small drafts instead of a second Window scene.
-enum SettingsRequest: Equatable {
-    case overview
-    case addProject
-    case github
-    case gitlab
-    case addGitLab
-}
-
-enum SettingsTab: String, CaseIterable, Identifiable {
-    case projects = "本地项目"
-    case github = "GitHub"
-    case gitlab = "GitLab"
-
-    var id: String { rawValue }
-    var icon: String {
-        switch self {
-        case .projects: return "folder"
-        case .github: return "chevron.left.forwardslash.chevron.right"
-        case .gitlab: return "shippingbox"
-        }
-    }
-}
-
 @MainActor
 struct ProjectServiceDraft: Identifiable {
     let id: String
@@ -34,13 +8,17 @@ struct ProjectServiceDraft: Identifiable {
     var command: String
     var url: String
     var directory: String
+    /// An empty value means StackHub must not inspect or touch any port.
+    /// Multiple ports use a comma, such as `3000, 5173`.
+    var ports: String
 
-    init(id: String = UUID().uuidString, name: String = "服务", command: String = "", url: String = "", directory: String = "") {
+    init(id: String = UUID().uuidString, name: String = "服务", command: String = "", url: String = "", directory: String = "", ports: String = "") {
         self.id = id
         self.name = name
         self.command = command
         self.url = url
         self.directory = directory
+        self.ports = ports
     }
 }
 
@@ -55,7 +33,16 @@ final class ProjectDraft: ObservableObject {
         id = project?.id
         name = project?.name ?? ""
         directory = project?.directory ?? ""
-        services = project?.services.map { ProjectServiceDraft(id: $0.id, name: $0.name, command: $0.command, url: $0.url, directory: $0.directory ?? "") }
+        services = project?.services.map {
+            ProjectServiceDraft(
+                id: $0.id,
+                name: $0.name,
+                command: $0.command,
+                url: $0.url,
+                directory: $0.directory ?? "",
+                ports: $0.ports.map(String.init).joined(separator: ", ")
+            )
+        }
             ?? [ProjectServiceDraft()]
     }
 }
@@ -63,12 +50,16 @@ final class ProjectDraft: ObservableObject {
 @MainActor
 final class GitLabDraft: ObservableObject {
     let id: UUID?
+    /// This is non-sensitive metadata persisted with the instance. It lets the
+    /// editor preserve an existing token without reading Keychain to render.
+    let hasExistingToken: Bool
     @Published var name: String
     @Published var host: String
     @Published var token: String = ""
 
-    init(instance: GitLabInstance? = nil) {
+    init(instance: GitLabInstance? = nil, hasExistingToken: Bool = false) {
         id = instance?.id
+        self.hasExistingToken = hasExistingToken
         name = instance?.name ?? ""
         host = instance?.host ?? ""
     }
@@ -76,277 +67,249 @@ final class GitLabDraft: ObservableObject {
 
 @MainActor
 final class SettingsPanelState: ObservableObject {
-    @Published var selectedTab: SettingsTab = .projects
     @Published var projectDraft: ProjectDraft?
     @Published var gitlabDraft: GitLabDraft?
-    @Published var editingGitHub = false
-    @Published var feedback: String?
-    @Published var deletingProject: Project?
-    @Published var deletingInstance: GitLabInstance?
-
-    func consume(_ request: SettingsRequest?) {
-        guard let request else { return }
-        switch request {
-        case .overview: break
-        case .addProject: beginNewProject()
-        case .github: selectedTab = .github
-        case .gitlab: selectedTab = .gitlab
-        case .addGitLab: beginNewInstance()
-        }
-    }
 
     func beginNewProject() {
-        selectedTab = .projects
         projectDraft = ProjectDraft()
-        feedback = nil
     }
 
     func beginEditProject(_ project: Project) {
-        selectedTab = .projects
         projectDraft = ProjectDraft(project: project)
-        feedback = nil
     }
 
     func beginNewInstance() {
-        selectedTab = .gitlab
         gitlabDraft = GitLabDraft()
-        feedback = nil
     }
 
-    func beginEditInstance(_ instance: GitLabInstance) {
-        selectedTab = .gitlab
-        gitlabDraft = GitLabDraft(instance: instance)
-        feedback = nil
+    func beginEditInstance(_ instance: GitLabInstance, hasExistingToken: Bool) {
+        gitlabDraft = GitLabDraft(instance: instance, hasExistingToken: hasExistingToken)
     }
 
     func cancelEditor() {
         projectDraft = nil
         gitlabDraft = nil
-        editingGitHub = false
-        feedback = nil
     }
 }
 
-struct SettingsView: View {
+struct CIConnectionsSection: View {
     @EnvironmentObject private var store: StackHubStore
-    @ObservedObject var state: SettingsPanelState
-    @ObservedObject var githubOAuth: GitHubOAuthController
+    let onManageGitHub: () -> Void
+    let onAddGitLab: () -> Void
+    let onEditGitLab: (GitLabInstance) -> Void
+    @State private var deletingInstance: GitLabInstance?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("设置").font(.title3.weight(.semibold))
-                    Text("项目和认证连接都在当前面板管理").font(.caption2).foregroundStyle(.secondary)
-                }
-                Spacer()
-                Image(systemName: "lock.shield.fill").font(.caption).foregroundStyle(.teal)
-            }
-
-            HStack(spacing: 4) {
-                ForEach(SettingsTab.allCases) { tab in
-                    Button {
-                        withAnimation(.easeOut(duration: 0.16)) {
-                            state.selectedTab = tab
-                            state.cancelEditor()
-                        }
-                    } label: {
-                        Label(tab.rawValue, systemImage: tab.icon)
-                            .font(.caption2.weight(state.selectedTab == tab ? .semibold : .medium))
-                            .labelStyle(.titleAndIcon)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 8)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(state.selectedTab == tab ? .white : .white.opacity(0.5))
-                    .background(state.selectedTab == tab ? Color.white.opacity(0.13) : .clear, in: RoundedRectangle(cornerRadius: 9))
-                }
-            }
-            .padding(3)
-            .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 11))
-            .overlay(RoundedRectangle(cornerRadius: 11).stroke(.white.opacity(0.1)))
-
-            Group {
-                switch state.selectedTab {
-                case .projects: projectsContent
-                case .github: githubContent
-                case .gitlab: gitlabContent
-                }
-            }
+            SectionLabel(title: "CI 连接", trailing: "GitHub · GitLab")
+            githubConnection
+            gitLabConnections
         }
-        .onAppear { consumeRequest() }
-        .onChange(of: store.settingsRequest) { _, _ in consumeRequest() }
-        .alert("移除本地项目？", isPresented: Binding(get: { state.deletingProject != nil }, set: { if !$0 { state.deletingProject = nil } })) {
-            Button("移除项目", role: .destructive) {
-                if let project = state.deletingProject { store.removeProject(project) }
-                state.deletingProject = nil
-            }
-            Button("取消", role: .cancel) { state.deletingProject = nil }
-        } message: {
-            Text("只移除 StackHub 配置，不会删除磁盘上的项目文件。")
-        }
-        .alert("移除 GitLab 实例？", isPresented: Binding(get: { state.deletingInstance != nil }, set: { if !$0 { state.deletingInstance = nil } })) {
+        .alert("移除 GitLab 实例？", isPresented: Binding(get: { deletingInstance != nil }, set: { if !$0 { deletingInstance = nil } })) {
             Button("移除实例", role: .destructive) {
-                if let instance = state.deletingInstance { store.removeInstance(instance) }
-                state.deletingInstance = nil
+                if let instance = deletingInstance { store.removeInstance(instance) }
+                deletingInstance = nil
             }
-            Button("取消", role: .cancel) { state.deletingInstance = nil }
+            Button("取消", role: .cancel) { deletingInstance = nil }
         } message: {
             Text("该实例的 Token 和缓存流水线也会从本机移除。")
         }
     }
 
-    private func consumeRequest() {
-        state.consume(store.settingsRequest)
-        if store.settingsRequest != nil { store.settingsRequest = nil }
-    }
-
-    private var projectsContent: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if let draft = state.projectDraft {
-                ProjectInlineEditor(draft: draft) {
-                    saveProject(draft)
-                } onCancel: {
-                    state.cancelEditor()
-                }
-            } else {
-                sectionHeader("本地项目", detail: "仅用于本机服务的启动和停止", actionTitle: "添加") { state.beginNewProject() }
-                if store.projects.isEmpty {
-                    SettingsEmptyRow(icon: "folder", title: "还没有本地项目", detail: "添加工作目录和启动命令后即可管理服务")
-                } else {
-                    VStack(spacing: 0) {
-                        ForEach(store.projects) { project in
-                            HStack(spacing: 9) {
-                                Image(systemName: "folder.fill")
-                                    .foregroundStyle(.orange)
-                                    .frame(width: 29, height: 29)
-                                    .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(project.name).font(.caption.weight(.semibold))
-                                    Text(project.directory).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                                }
-                                Spacer(minLength: 2)
-                                Text("\(project.services.count) 服务").font(.caption2).foregroundStyle(.secondary)
-                                Button { state.beginEditProject(project) } label: { Image(systemName: "pencil") }
-                                    .buttonStyle(StackIconButtonStyle()).controlSize(.small)
-                                Button { state.deletingProject = project } label: { Image(systemName: "trash") }
-                                    .buttonStyle(StackIconButtonStyle()).controlSize(.small)
-                            }
-                            .padding(10)
-                            if project.id != store.projects.last?.id { Divider().padding(.leading, 48) }
-                        }
-                    }
-                    .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14))
-                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(.white.opacity(0.075)))
-                }
-                Text("本地项目与 CI 关注项目相互独立。").font(.caption2).foregroundStyle(.secondary).padding(.horizontal, 2)
-            }
-        }
-    }
-
-    private var githubContent: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if state.editingGitHub {
-                GitHubInlineEditor(isConnected: store.isGitHubConnected, oauth: githubOAuth, onOAuthToken: { credential in
-                    store.saveGitHubCredential(credential)
-                    store.refreshCI()
-                    state.cancelEditor()
-                }, onDisconnect: disconnectGitHub, onCancel: { state.cancelEditor() })
-            } else {
-                sectionHeader("GitHub", detail: "读取你有权限访问的仓库、Actions 和作业日志")
-                HStack(spacing: 10) {
-                    Image(systemName: "chevron.left.forwardslash.chevron.right")
-                        .font(.caption.weight(.bold))
-                        .frame(width: 31, height: 31)
-                        .background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 9))
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("GitHub 授权").font(.caption.weight(.semibold))
-                        Text(store.isGitHubConnected ? "Token 已安全保存在本机钥匙串" : "尚未连接")
-                            .font(.caption2).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Circle().fill(store.isGitHubConnected ? .green : .orange).frame(width: 8, height: 8)
-                    Button(store.isGitHubConnected ? "管理" : "连接") {
-                        state.editingGitHub = true
-                    }.buttonStyle(StackSecondaryButtonStyle()).controlSize(.small)
-                }
-                .padding(12)
-                .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14))
-                .overlay(RoundedRectangle(cornerRadius: 14).stroke(.white.opacity(0.075)))
-                SettingsInfoCard(icon: "lock.shield", title: "本地安全存储", detail: "Token 只保存在当前 Mac 的钥匙串，不会写入项目文件或 UserDefaults。")
-            }
-        }
-    }
-
-    private var gitlabContent: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if let draft = state.gitlabDraft {
-                GitLabInlineEditor(draft: draft, existingToken: draft.id.flatMap { id in store.instances.first(where: { $0.id == id }).flatMap { KeychainVault.shared.read(account: "gitlab:\($0.host)") } }, onSave: { saveGitLab(draft) }, onCancel: { state.cancelEditor() })
-            } else {
-                sectionHeader("GitLab", detail: "支持 GitLab.com 和多个自建实例", actionTitle: "添加") { state.beginNewInstance() }
-                if store.instances.isEmpty {
-                    SettingsEmptyRow(icon: "shippingbox", title: "尚未添加 GitLab 实例", detail: "每个实例独立保存地址、项目和 Token")
-                } else {
-                    VStack(spacing: 0) {
-                        ForEach(store.instances) { instance in
-                            HStack(spacing: 9) {
-                                Circle().fill(KeychainVault.shared.read(account: "gitlab:\(instance.host)") == nil ? .orange : .green).frame(width: 8, height: 8)
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(instance.name).font(.caption.weight(.semibold))
-                                    Text(instance.host).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                                }
-                                Spacer(minLength: 2)
-                                Button { state.beginEditInstance(instance) } label: { Image(systemName: "pencil") }
-                                    .buttonStyle(StackIconButtonStyle()).controlSize(.small)
-                                Button { state.deletingInstance = instance } label: { Image(systemName: "trash") }
-                                    .buttonStyle(StackIconButtonStyle()).controlSize(.small)
-                            }
-                            .padding(10)
-                            if instance.id != store.instances.last?.id { Divider().padding(.leading, 17) }
-                        }
-                    }
-                    .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14))
-                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(.white.opacity(0.075)))
-                }
-            }
-        }
-    }
-
-    private func sectionHeader(_ title: String, detail: String, actionTitle: String? = nil, action: (() -> Void)? = nil) -> some View {
-        HStack(alignment: .firstTextBaseline) {
+    private var githubConnection: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "chevron.left.forwardslash.chevron.right")
+                .font(.caption.weight(.bold))
+                .frame(width: 31, height: 31)
+                .background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 9))
             VStack(alignment: .leading, spacing: 3) {
-                Text(title).font(.subheadline.weight(.semibold))
-                Text(detail).font(.caption2).foregroundStyle(.secondary)
+                Text("GitHub 授权").font(.caption.weight(.semibold))
+                Text(store.isGitHubConnected ? "已连接，仓库和 Actions 可同步" : "尚未连接")
+                    .font(.caption2).foregroundStyle(.secondary)
             }
             Spacer()
-            if let actionTitle, let action { Button(actionTitle, action: action).buttonStyle(StackSecondaryButtonStyle()).controlSize(.small) }
+            Circle().fill(store.isGitHubConnected ? .green : .orange).frame(width: 8, height: 8)
+            Button(store.isGitHubConnected ? "管理" : "连接", action: onManageGitHub)
+                .buttonStyle(StackSecondaryButtonStyle())
+                .controlSize(.small)
         }
+        .padding(12)
+        .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(.white.opacity(0.075)))
     }
 
-    private func saveProject(_ draft: ProjectDraft) {
+    private var gitLabConnections: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("GitLab 实例").font(.caption.weight(.semibold))
+                    Text("支持 GitLab.com 和多个自建实例").font(.caption2).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("添加", action: onAddGitLab)
+                    .buttonStyle(StackSecondaryButtonStyle())
+                    .controlSize(.small)
+            }
+            if store.instances.isEmpty {
+                SettingsEmptyRow(icon: "shippingbox", title: "尚未添加 GitLab 实例", detail: "每个实例独立保存地址和 Token")
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(store.instances) { instance in
+                        HStack(spacing: 9) {
+                            Circle().fill(store.hasGitLabCredential(instance) ? .green : .orange).frame(width: 8, height: 8)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(instance.name).font(.caption.weight(.semibold))
+                                Text(instance.host).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                            }
+                            Spacer(minLength: 2)
+                            Button { onEditGitLab(instance) } label: { Image(systemName: "pencil") }
+                                .buttonStyle(StackIconButtonStyle()).controlSize(.small)
+                            Button { deletingInstance = instance } label: { Image(systemName: "trash") }
+                                .buttonStyle(StackIconButtonStyle()).controlSize(.small)
+                        }
+                        .padding(10)
+                        if instance.id != store.instances.last?.id { Divider().padding(.leading, 17) }
+                    }
+                }
+                .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14))
+                .overlay(RoundedRectangle(cornerRadius: 14).stroke(.white.opacity(0.075)))
+            }
+        }
+    }
+}
+
+struct ProjectEditorDetailView: View {
+    @EnvironmentObject private var store: StackHubStore
+    @ObservedObject var draft: ProjectDraft
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ConfigurationDetailHeader(
+                icon: "folder.badge.gearshape",
+                title: draft.id == nil ? "添加项目" : "编辑项目",
+                subtitle: "配置本地工作目录、服务和启动命令",
+                onClose: onClose
+            )
+            ScrollView {
+                ProjectInlineEditor(draft: draft, onSave: saveProject, onCancel: onClose)
+                    .padding(16)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(Color(red: 0.055, green: 0.075, blue: 0.12))
+        .closesOnEscape(perform: onClose)
+    }
+
+    private func saveProject() {
         let succeeded: Bool
         if let id = draft.id, let project = store.projects.first(where: { $0.id == id }) {
             succeeded = store.updateProject(project, name: draft.name, directory: draft.directory, services: draft.services)
         } else {
             succeeded = store.addProject(name: draft.name, directory: draft.directory, services: draft.services)
         }
-        if succeeded { state.cancelEditor() }
+        if succeeded { onClose() }
+    }
+}
+
+struct GitHubAuthorizationDetailView: View {
+    @EnvironmentObject private var store: StackHubStore
+    @ObservedObject var oauth: GitHubOAuthController
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ConfigurationDetailHeader(
+                icon: "chevron.left.forwardslash.chevron.right",
+                title: "GitHub 授权",
+                subtitle: "连接后同步仓库、Actions 和作业日志",
+                onClose: onClose
+            )
+            ScrollView {
+                GitHubInlineEditor(
+                    isConnected: store.isGitHubConnected,
+                    oauth: oauth,
+                    onOAuthToken: { credential in
+                        store.saveGitHubCredential(credential)
+                        store.refreshCI()
+                        onClose()
+                    },
+                    onDisconnect: {
+                        store.disconnectGitHub()
+                        onClose()
+                    },
+                    onCancel: onClose
+                )
+                .padding(16)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(Color(red: 0.055, green: 0.075, blue: 0.12))
+        .closesOnEscape(perform: onClose)
+    }
+}
+
+struct GitLabInstanceDetailView: View {
+    @EnvironmentObject private var store: StackHubStore
+    @ObservedObject var draft: GitLabDraft
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ConfigurationDetailHeader(
+                icon: "shippingbox",
+                title: draft.id == nil ? "添加 GitLab 实例" : "编辑 GitLab 实例",
+                subtitle: "实例地址和 Token 仅保存在本机",
+                onClose: onClose
+            )
+            ScrollView {
+                GitLabInlineEditor(draft: draft, hasExistingToken: draft.hasExistingToken, onSave: saveGitLab, onCancel: onClose)
+                    .padding(16)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(Color(red: 0.055, green: 0.075, blue: 0.12))
+        .closesOnEscape(perform: onClose)
     }
 
-    private func disconnectGitHub() {
-        store.disconnectGitHub()
-        state.cancelEditor()
-    }
-
-    private func saveGitLab(_ draft: GitLabDraft) {
+    private func saveGitLab() {
         let succeeded: Bool
         if let id = draft.id, let instance = store.instances.first(where: { $0.id == id }) {
             succeeded = store.updateInstance(instance, name: draft.name, host: draft.host, project: "", token: draft.token)
         } else {
             succeeded = store.addInstance(name: draft.name, host: draft.host, project: "", token: draft.token)
         }
-        if succeeded { state.cancelEditor() }
+        if succeeded { onClose() }
+    }
+}
+
+private struct ConfigurationDetailHeader: View {
+    let icon: String
+    let title: String
+    let subtitle: String
+    let onClose: () -> Void
+
+    var body: some View {
+        HStack(spacing: 11) {
+            Button(action: onClose) {
+                Label("返回", systemImage: "chevron.left")
+            }
+            .buttonStyle(StackSecondaryButtonStyle())
+            .controlSize(.small)
+            .accessibilityLabel("返回")
+
+            Image(systemName: icon)
+                .font(.title3)
+                .foregroundStyle(.teal)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.subheadline.weight(.semibold))
+                Text(subtitle).font(.caption2).foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .overlay(alignment: .bottom) { Rectangle().fill(.white.opacity(0.08)).frame(height: 1) }
     }
 }
 
@@ -390,7 +353,13 @@ private struct ProjectInlineEditor: View {
                             defaultDirectory: draft.directory,
                             pickerTitle: "选择服务启动目录"
                         )
-                        labeledField("访问地址（可选）", text: $service.url)
+                        HStack(spacing: 8) {
+                            labeledField("访问地址（可选）", text: $service.url)
+                            labeledField("监听端口（可选，逗号分隔）", text: $service.ports)
+                        }
+                        Text("例如 3000, 5173；启动前会终止占用这些 TCP 端口的进程。")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
                     .padding(10)
                     .background(Color.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 11))
@@ -470,7 +439,7 @@ private struct DirectoryInputField: View {
 
 private struct GitLabInlineEditor: View {
     @ObservedObject var draft: GitLabDraft
-    let existingToken: String?
+    let hasExistingToken: Bool
     let onSave: () -> Void
     let onCancel: () -> Void
 
@@ -478,7 +447,7 @@ private struct GitLabInlineEditor: View {
     private var canSave: Bool {
         !draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
         !draft.host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-        (existingToken != nil || !draft.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        hasExistingToken || !draft.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var body: some View {
@@ -505,14 +474,14 @@ private struct GitLabInlineEditor: View {
 
             HStack(spacing: 8) {
                 Circle()
-                    .fill(existingToken == nil ? .orange : .green)
+                    .fill(hasExistingToken ? .green : .orange)
                     .frame(width: 8, height: 8)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(draft.name.isEmpty ? "新 GitLab 实例" : draft.name)
                         .font(.caption.weight(.semibold))
-                    Text(existingToken == nil ? "尚未连接" : "已保存访问令牌")
+                    Text(hasExistingToken ? "已保存访问令牌" : "尚未连接")
                         .font(.caption2)
-                        .foregroundStyle(existingToken == nil ? .orange : .green)
+                        .foregroundStyle(hasExistingToken ? .green : .orange)
                 }
                 Spacer(minLength: 0)
                 if !draft.host.isEmpty {
@@ -564,13 +533,13 @@ private struct GitLabInlineEditor: View {
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
-                    if existingToken != nil {
+                    if hasExistingToken {
                         Label("已保存", systemImage: "checkmark.circle.fill")
                             .font(.caption2.weight(.medium))
                             .foregroundStyle(.green)
                     }
                 }
-                SecureField(existingToken == nil ? "glpat-••••••••" : "留空则保留当前令牌", text: $draft.token)
+                SecureField(hasExistingToken ? "留空则保留当前令牌" : "glpat-••••••••", text: $draft.token)
                     .textFieldStyle(StackInputFieldStyle())
                 Label("令牌只保存到本机钥匙串，不会写入配置文件。", systemImage: "lock.shield")
                     .font(.caption2)
@@ -582,7 +551,7 @@ private struct GitLabInlineEditor: View {
 
             HStack {
                 if !canSave {
-                    Text(existingToken == nil ? "填写名称、地址和令牌后即可连接" : "填写名称和地址后即可保存")
+                    Text(hasExistingToken ? "填写名称和地址后即可保存" : "填写名称、地址和令牌后即可连接")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)

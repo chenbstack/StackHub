@@ -1,24 +1,78 @@
 # StackHub
 
-Your Development Stack, One Click Away
+> 把本地开发服务和 CI 流水线集中到 macOS 菜单栏。
 
-## Swift 原生 macOS 应用
+StackHub 是一款原生 SwiftUI 菜单栏应用：在一个小面板中管理本地项目的启动、停止、重启和日志，同时查看 GitHub Actions 与 GitLab CI 的流水线状态。
 
-原生版本位于 [swift-prototype](/Users/chen/work/private/StackHub/swift-prototype)：
+## 界面预览
 
-- 用 \`MenuBarExtra\` 提供菜单栏图标和弹出面板
-- SwiftUI 实现 Projects、CI、Settings 页面，全部在菜单栏面板内完成
-- 支持 GitHub Actions、多个 GitLab 实例、流水线阶段和作业日志详情
-- GitHub 支持浏览器 Device Flow OAuth；GitLab 支持多个实例独立授权
-- 设置页内联管理本地项目、GitHub 授权和 GitLab 多实例；凭据写入 macOS 钥匙串
-- 每个服务可单独选择启动目录，留空时使用项目工作目录；支持绝对路径、`~` 和相对项目目录的路径（如 `backend`、`frontend`），保存后在下次启动服务时生效
-- GitHub 仅同步最近更新的 8 个自有仓库，缓存优先刷新并限制流水线请求并发
-- 主菜单栏面板支持底部拖动调整高度，并记住上次尺寸
+### 本地项目与服务
 
-使用 Xcode 打开 \`swift-prototype/Package.swift\`，或在项目目录执行：
+![项目服务总览（示例数据）](docs/screenshots/projects-sanitized.png)
+
+### 全屏运行日志
+
+![运行日志（示例数据）](docs/screenshots/logs-sanitized.png)
+
+以上截图均使用虚构的项目名、目录、端口和地址，不包含 Token、真实路径或生产日志。
+
+## 功能
+
+- 菜单栏原生面板，支持拖动调整高度并记住尺寸。
+- 为每个本地项目配置工作目录、服务、启动命令、访问地址和一个或多个 TCP 端口。
+- 启动前只释放明确配置的端口；支持以英文逗号分隔多个端口，例如 `3000, 5173`。
+- 服务启停、重启、自动读取 stdout/stderr；检测到错误日志时标记为警告而非“健康”。
+- ANSI 彩色日志、全屏日志页面、`Esc` 或“返回”关闭日志／编辑页面。
+- 项目页直接添加、编辑和移除本地项目；CI 页直接管理 GitHub 授权和 GitLab 实例，无独立设置页。
+- GitHub Actions 支持浏览器 Device Flow OAuth 和增量仓库同步；GitLab 支持多个实例及完整发现。
+- CI 凭据保存在 macOS 钥匙串的单一加密凭据包中；旧版独立条目在首次实际使用时按需迁移。
+
+## 运行
+
+要求 macOS 14 或更高版本，以及 Swift 5.9 或更高版本。
 
 ```bash
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build
+cd swift-prototype
+swift build
+swift run StackHub
 ```
 
-GitHub OAuth App 已创建并开启 Device Flow，应用内置其公开 Client ID；如需替换 OAuth App，可在设置页修改 Client ID。Client Secret 不会写入应用。
+也可以用 Xcode 打开 [swift-prototype/Package.swift](swift-prototype/Package.swift)。
+
+## 使用方式
+
+1. 点击菜单栏的 StackHub 图标，进入“项目”页。
+2. 点击“添加项目”，填写项目工作目录、服务命令和可选端口。
+3. 在项目卡片中启动、停止或重启服务；点击文档图标进入日志。
+4. 切换至“CI”，连接 GitHub 或添加 GitLab 实例，然后查看、关注和刷新流水线。
+
+### 端口处理
+
+端口字段留空时，StackHub 不会检查或终止任何进程。填写端口后，启动服务前会确认监听进程并先尝试正常终止；仍被占用时才强制结束。请只填写属于该服务的端口。
+
+### 凭据与授权
+
+StackHub 不将 Token 写进项目配置、日志或 `UserDefaults`。GitHub access/refresh token 与 GitLab Token 统一保存在钥匙串的 `ci.credentials.v1` 条目中。
+
+从旧版本升级后，已有的独立凭据会在对应 GitHub 或 GitLab 账号首次刷新时迁入该条目；迁移完成后不再读取旧项。
+
+## 项目结构
+
+```text
+swift-prototype/
+├── Sources/                  # SwiftUI 应用与 CI、本地服务逻辑
+├── Tests/                    # 单元测试
+├── Package.swift             # Swift Package Manager 清单
+└── dist/StackHub.app         # 本地构建的应用包（不提交）
+docs/
+└── screenshots/              # README 脱敏示例图
+```
+
+## 构建发布包
+
+```bash
+cd swift-prototype
+swift build -c release
+```
+
+发布可执行文件位于 `.build/release/StackHub`。若需要 macOS `.app` 包，请以 `dist/StackHub.app/Contents/MacOS/StackHub` 为目标替换该可执行文件后进行代码签名。

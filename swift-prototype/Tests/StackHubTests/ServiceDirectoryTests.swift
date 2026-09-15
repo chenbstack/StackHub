@@ -3,6 +3,45 @@ import XCTest
 @testable import StackHub
 
 final class ServiceDirectoryTests: XCTestCase {
+    func testStartupEvidencePrioritizesErrorsOverReadySignals() {
+        XCTAssertEqual(ServiceStartupEvidence.classify(log: "Server listening on http://127.0.0.1:3000"), .ready)
+        XCTAssertEqual(ServiceStartupEvidence.classify(log: "启动完成\nERROR: unable to bind port"), .warning)
+        XCTAssertNil(ServiceStartupEvidence.classify(log: "loading configuration"))
+    }
+
+    func testProjectRuntimeStateDoesNotShowStoppedServicesAsReady() {
+        let stopped = Service(id: "stopped", name: "Stopped", command: "", url: "", status: .stopped)
+        let running = Service(id: "running", name: "Running", command: "", url: "", status: .running)
+        let failed = Service(id: "failed", name: "Failed", command: "", url: "", status: .failed)
+
+        XCTAssertEqual(Project(id: "a", name: "Stopped", initial: "S", serviceCount: 1, issue: false, isExpanded: false, services: [stopped], directory: "/tmp").runtimeState, .stopped)
+        XCTAssertEqual(Project(id: "b", name: "Partial", initial: "P", serviceCount: 2, issue: false, isExpanded: false, services: [running, stopped], directory: "/tmp").runtimeState, .partial)
+        XCTAssertEqual(Project(id: "c", name: "Ready", initial: "R", serviceCount: 1, issue: false, isExpanded: false, services: [running], directory: "/tmp").runtimeState, .ready)
+        XCTAssertEqual(Project(id: "d", name: "Issue", initial: "I", serviceCount: 1, issue: false, isExpanded: false, services: [failed], directory: "/tmp").runtimeState, .issue)
+    }
+
+    func testANSILogRendererPreservesColorSegmentsAndRemovesControlCodes() {
+        let source = "plain \u{001B}[36mcyan\u{001B}[39m \u{001B}[38;2;255;100;0morange\u{001B}[0m"
+        XCTAssertEqual(ANSILogRenderer.segments(from: source), [
+            ANSILogSegment(text: "plain ", foreground: nil),
+            ANSILogSegment(text: "cyan", foreground: .standard(6)),
+            ANSILogSegment(text: " ", foreground: nil),
+            ANSILogSegment(text: "orange", foreground: .rgb(255, 100, 0))
+        ])
+        XCTAssertEqual(String(ANSILogRenderer.attributedString(from: source).characters), "plain cyan orange")
+    }
+
+    func testPortConfigurationValidationAndPIDParsing() {
+        XCTAssertEqual(ServicePortGuard.configuredPorts(from: " 3000, 5173 "), [3000, 5173])
+        XCTAssertEqual(ServicePortGuard.configuredPorts(from: " \n "), [])
+        XCTAssertNil(ServicePortGuard.configuredPorts(from: "0, 5173"))
+        XCTAssertNil(ServicePortGuard.configuredPorts(from: "3000,,5173"))
+        XCTAssertNil(ServicePortGuard.configuredPorts(from: "3000, 3000"))
+        XCTAssertTrue(ServicePortGuard.hasValidConfiguration("3000,5173"))
+        XCTAssertFalse(ServicePortGuard.hasValidConfiguration("three thousand"))
+        XCTAssertEqual(ServicePortGuard.listenerProcessIDs(from: "42\n17\n42\ninvalid\n"), [17, 42])
+    }
+
     func testLegacyProjectWithoutServiceDirectoryStillLoads() throws {
         let json = """
         [{"id":"legacy","name":"Existing project","initial":"E","serviceCount":1,
@@ -12,8 +51,22 @@ final class ServiceDirectoryTests: XCTestCase {
         let project = try XCTUnwrap(JSONDecoder().decode([Project].self, from: Data(json.utf8)).first)
 
         XCTAssertNil(project.services[0].directory)
+        XCTAssertEqual(project.services[0].ports, [])
         XCTAssertEqual(WorkingDirectory.resolve(project.services[0].directory, projectDirectory: project.directory).path,
                        "/tmp/existing-project")
+    }
+
+    func testLegacySinglePortMigratesToPortList() throws {
+        let json = """
+        [{"id":"legacy","name":"Existing project","initial":"E","serviceCount":1,
+          "issue":false,"isExpanded":true,"directory":"/tmp/existing-project",
+          "services":[{"id":"api","name":"API","command":"npm run dev","url":"","status":"stopped","port":3000}]}]
+        """
+        let project = try XCTUnwrap(JSONDecoder().decode([Project].self, from: Data(json.utf8)).first)
+
+        XCTAssertEqual(project.services[0].ports, [3000])
+        let encoded = try JSONEncoder().encode(project.services[0])
+        XCTAssertTrue(String(decoding: encoded, as: UTF8.self).contains("\"ports\":[3000]"))
     }
 
     func testRelativeAbsoluteAndHomePathsResolveAgainstProjectDirectory() {
@@ -30,6 +83,20 @@ final class ServiceDirectoryTests: XCTestCase {
     }
 
     @MainActor
+    func testProjectRejectsInvalidConfiguredPort() throws {
+        let suite = "StackHubTests.InvalidPort.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = StackHubStore(defaults: defaults)
+
+        XCTAssertFalse(store.addProject(name: "Invalid port", directory: "/tmp", services: [
+            ProjectServiceDraft(name: "API", command: "/bin/sleep 1", ports: "70000, 5173")
+        ]))
+        XCTAssertEqual(store.toast, "服务端口须为 1–65535 的逗号分隔列表，或留空")
+        XCTAssertTrue(store.projects.isEmpty)
+    }
+
+    @MainActor
     func testAddEditReloadAndClearServiceDirectories() throws {
         let suite = "StackHubTests.ServiceDirectories.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -39,13 +106,15 @@ final class ServiceDirectoryTests: XCTestCase {
         XCTAssertTrue(store.addProject(name: "Web app", directory: "/tmp/project", services: [
             ProjectServiceDraft(name: "Backend", command: "/bin/pwd", directory: " backend "),
             ProjectServiceDraft(name: "Frontend", command: "/bin/pwd", directory: "/tmp/前端 app"),
-            ProjectServiceDraft(name: "Worker", command: "/bin/pwd")
+            ProjectServiceDraft(name: "Worker", command: "/bin/pwd", ports: "3100, 5173")
         ]))
         let saved = try XCTUnwrap(StackHubStore(defaults: defaults).projects.first)
         XCTAssertEqual(saved.services.map(\.directory), ["backend", "/tmp/前端 app", nil])
+        XCTAssertEqual(saved.services.map(\.ports), [[], [], [3100, 5173]])
 
         let draft = ProjectDraft(project: saved)
         XCTAssertEqual(draft.services.map(\.directory), ["backend", "/tmp/前端 app", ""])
+        XCTAssertEqual(draft.services.map(\.ports), ["", "", "3100, 5173"])
         draft.directory = "/tmp/moved project"
         draft.services[0].directory = " ../backend "
         draft.services[1].directory = " \n "
@@ -55,6 +124,7 @@ final class ServiceDirectoryTests: XCTestCase {
         let updated = try XCTUnwrap(StackHubStore(defaults: defaults).projects.first)
         XCTAssertEqual(updated.services.map(\.id), saved.services.map(\.id))
         XCTAssertEqual(updated.services.map(\.directory), ["../backend", nil, "/tmp/external worker"])
+        XCTAssertEqual(updated.services.map(\.ports), [[], [], [3100, 5173]])
         XCTAssertEqual(WorkingDirectory.resolve(updated.services[0].directory, projectDirectory: updated.directory).path, "/tmp/backend")
         XCTAssertEqual(WorkingDirectory.resolve(updated.services[1].directory, projectDirectory: updated.directory).path, "/tmp/moved project")
         XCTAssertEqual(ProjectDraft(project: updated).services[1].directory, "")
@@ -166,6 +236,68 @@ final class ServiceDirectoryTests: XCTestCase {
     }
 
     @MainActor
+    func testServiceLogEvidenceControlsReadyAndWarningStates() async throws {
+        let suite = "StackHubTests.ServiceReadiness.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("StackHub-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let store = StackHubStore(defaults: defaults)
+        XCTAssertTrue(store.addProject(name: "Readiness", directory: directory.path, services: [
+            ProjectServiceDraft(name: "Ready", command: "/bin/sh -c 'echo \"Server listening on http://127.0.0.1:3000\"; sleep 60'"),
+            ProjectServiceDraft(name: "Warning", command: "/bin/sh -c 'echo \"ERROR: unable to bind port\" >&2; sleep 60'")
+        ]))
+        let services = store.projects[0].services
+        for service in services { store.serviceAction(service) }
+
+        for _ in 0..<100 {
+            let states = store.projects[0].services.map(\.status)
+            if states.contains(.running), states.contains(.warning) { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        XCTAssertEqual(store.projects[0].services.first { $0.name == "Ready" }?.status, .running)
+        XCTAssertEqual(store.projects[0].services.first { $0.name == "Warning" }?.status, .warning)
+        store.stopAllServices()
+    }
+
+    @MainActor
+    func testRestartStopsBeforeStartingReplacement() async throws {
+        let suite = "StackHubTests.Restart.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("StackHub-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let store = StackHubStore(defaults: defaults)
+        XCTAssertTrue(store.addProject(name: "Restart", directory: directory.path, services: [
+            ProjectServiceDraft(name: "Server", command: "/bin/sh -c 'echo ready; sleep 60'")
+        ]))
+        let service = try XCTUnwrap(store.projects.first?.services.first)
+        store.serviceAction(service)
+        for _ in 0..<100 {
+            if store.projects[0].services[0].status == .running { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(store.projects[0].services[0].status, .running)
+
+        store.restartService(service)
+        for _ in 0..<100 {
+            if store.projects[0].services[0].status == .running,
+               (store.serviceLogs[service.id] ?? "").contains("ready") { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        XCTAssertEqual(store.projects[0].services[0].status, .running)
+        store.stopAllServices()
+    }
+
+    @MainActor
     func testToastAutomaticallyDismissesAndResetsItsTimer() async throws {
         let suite = "StackHubTests.Toast.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -197,7 +329,7 @@ final class ServiceDirectoryTests: XCTestCase {
         ]))
         let service = try XCTUnwrap(store.projects.first?.services.first)
         store.serviceAction(service)
-        XCTAssertEqual(store.projects[0].services[0].status, .running)
+        XCTAssertEqual(store.projects[0].services[0].status, .starting)
 
         store.stopAllServices()
         XCTAssertEqual(store.projects[0].services[0].status, .stopped)

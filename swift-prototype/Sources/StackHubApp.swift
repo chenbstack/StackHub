@@ -39,16 +39,77 @@ struct StackHubApp: App {
 enum PanelTab: String, CaseIterable, Identifiable {
     case projects = "项目"
     case ci = "CI"
-    case settings = "设置"
     var id: String { rawValue }
 }
 
+enum PanelDestination: Equatable {
+    case projectEditor
+    case githubAuthorization
+    case gitLabEditor
+}
+
+/// MenuBarExtra does not reliably route Escape through SwiftUI's
+/// `onExitCommand`, especially while a text field is focused. Use an AppKit
+/// local monitor for the short-lived full-panel detail views instead.
+struct EscapeKeyCloseHandler: NSViewRepresentable {
+    let onEscape: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onEscape: onEscape)
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        context.coordinator.install()
+        return NSView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.onEscape = onEscape
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.removeMonitor()
+    }
+
+    final class Coordinator {
+        var onEscape: () -> Void
+        private var monitor: Any?
+
+        init(onEscape: @escaping () -> Void) {
+            self.onEscape = onEscape
+        }
+
+        func install() {
+            guard monitor == nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard event.keyCode == 53, !event.isARepeat else { return event }
+                DispatchQueue.main.async { self?.onEscape() }
+                return nil
+            }
+        }
+
+        func removeMonitor() {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+        }
+
+        deinit { removeMonitor() }
+    }
+}
+
+extension View {
+    func closesOnEscape(perform action: @escaping () -> Void) -> some View {
+        background(EscapeKeyCloseHandler(onEscape: action).frame(width: 0, height: 0))
+    }
+}
+
 enum ServiceStatus: String, Codable {
-    case running, starting, stopped, failed
+    case running, starting, warning, stopped, failed
     var color: Color {
         switch self {
         case .running: return .green
         case .starting: return .orange
+        case .warning: return .yellow
         case .stopped: return .gray
         case .failed: return .red
         }
@@ -57,9 +118,14 @@ enum ServiceStatus: String, Codable {
         switch self {
         case .running: return "运行中"
         case .starting: return "启动中"
+        case .warning: return "警告"
         case .stopped: return "已停止"
         case .failed: return "失败"
         }
+    }
+
+    var hasManagedProcess: Bool {
+        self == .starting || self == .running || self == .warning
     }
 }
 
@@ -72,6 +138,51 @@ struct Service: Identifiable, Codable {
     // Optional so saved services from earlier versions keep decoding and
     // continue to use their project's working directory.
     var directory: String? = nil
+    // An empty list means startup leaves every port untouched. Older saved
+    // services used a single `port`; custom decoding migrates it to this list.
+    var ports: [Int] = []
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, command, url, status, directory, ports, port
+    }
+
+    init(id: String, name: String, command: String, url: String, status: ServiceStatus, directory: String? = nil, ports: [Int] = []) {
+        self.id = id
+        self.name = name
+        self.command = command
+        self.url = url
+        self.status = status
+        self.directory = directory
+        self.ports = ports
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        command = try container.decode(String.self, forKey: .command)
+        url = try container.decode(String.self, forKey: .url)
+        status = try container.decode(ServiceStatus.self, forKey: .status)
+        directory = try container.decodeIfPresent(String.self, forKey: .directory)
+        if let configuredPorts = try container.decodeIfPresent([Int].self, forKey: .ports) {
+            ports = configuredPorts
+        } else if let legacyPort = try container.decodeIfPresent(Int.self, forKey: .port) {
+            ports = [legacyPort]
+        } else {
+            ports = []
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(command, forKey: .command)
+        try container.encode(url, forKey: .url)
+        try container.encode(status, forKey: .status)
+        try container.encodeIfPresent(directory, forKey: .directory)
+        try container.encode(ports, forKey: .ports)
+    }
 }
 
 struct Project: Identifiable, Codable {
@@ -83,6 +194,42 @@ struct Project: Identifiable, Codable {
     var isExpanded: Bool
     var services: [Service]
     var directory: String
+}
+
+enum ProjectRuntimeState: Equatable {
+    case ready, partial, stopped, issue
+
+    var label: String {
+        switch self {
+        case .ready: return "已就绪"
+        case .partial: return "部分运行"
+        case .stopped: return "已停止"
+        case .issue: return "有问题"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .ready: return .green
+        case .partial: return .orange
+        case .stopped: return .gray
+        case .issue: return .orange
+        }
+    }
+}
+
+extension Project {
+    var hasServiceIssue: Bool {
+        issue || services.contains { $0.status == .warning || $0.status == .failed }
+    }
+
+    var runtimeState: ProjectRuntimeState {
+        if hasServiceIssue { return .issue }
+        guard !services.isEmpty else { return .stopped }
+        if services.allSatisfy({ $0.status == .running }) { return .ready }
+        if services.contains(where: { $0.status.hasManagedProcess }) { return .partial }
+        return .stopped
+    }
 }
 
 struct GitLabInstance: Identifiable, Codable {
@@ -221,6 +368,18 @@ extension Pipeline {
 
 @MainActor
 final class StackHubStore: ObservableObject {
+    private struct CredentialBundle: Codable {
+        var githubAccessToken: String?
+        var githubRefreshToken: String?
+        var gitLabTokens: [String: String]
+
+        init(githubAccessToken: String? = nil, githubRefreshToken: String? = nil, gitLabTokens: [String: String] = [:]) {
+            self.githubAccessToken = githubAccessToken
+            self.githubRefreshToken = githubRefreshToken
+            self.gitLabTokens = gitLabTokens
+        }
+    }
+
     private static let projectIndexOrderVersion = 1
     private static let projectIndexOrderVersionKey = "stackhub.ci.index-order-version"
     private static let stagePrefetchProjectLimit = 8
@@ -229,6 +388,8 @@ final class StackHubStore: ObservableObject {
     private static let pipelineCacheKey = "stackhub.ci.pipeline-cache"
     private static let githubRepositorySyncDateKey = "stackhub.ci.github-repository-sync-date"
     private static let githubFullDiscoveryDateKey = "stackhub.ci.github-full-discovery-date"
+    private static let githubConnectedMetadataKey = "stackhub.github.connected"
+    private static let credentialBundleAccount = "ci.credentials.v1"
 
     @Published var tab: PanelTab = .projects
     @Published var projects: [Project] = []
@@ -248,7 +409,11 @@ final class StackHubStore: ObservableObject {
     @Published var selectedCIProjectID: String?
     @Published var expandedStageID: String? = "test"
     @Published var selectedPipeline: Pipeline?
-    @Published var settingsRequest: SettingsRequest?
+    @Published var selectedServiceLogID: String?
+    /// Credential state is non-sensitive metadata for the UI. Reading Keychain
+    /// is deferred until an action actually needs a token.
+    @Published private(set) var isGitHubConnected = false
+    @Published private(set) var gitLabCredentialHosts: Set<String> = []
     private var toastDismissTask: Task<Void, Never>?
     @Published var toast: String? {
         didSet {
@@ -269,11 +434,18 @@ final class StackHubStore: ObservableObject {
     @Published private(set) var loadingStageIDs: Set<String> = []
     private var runningProcesses: [String: Process] = [:]
     private var intentionallyStoppingServiceIDs: Set<String> = []
+    private var restartPendingServiceIDs: Set<String> = []
+    private var githubAccessTokenCache: String?
+    private var githubRefreshTokenCache: String?
+    private var gitLabTokenCache: [String: String] = [:]
+    private var credentialBundle = CredentialBundle()
+    private var didLoadCredentialBundle = false
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         loadPersistedState()
+        loadCredentialMetadata()
         selectedInstanceID = instances.first?.id
         selectedCIProjectID = ciProjects.first?.id
     }
@@ -284,6 +456,10 @@ final class StackHubStore: ObservableObject {
 
     var selectedCIProject: CIMonitoredProject? {
         ciProjects.first(where: { $0.id == selectedCIProjectID }) ?? ciProjects.first
+    }
+
+    var selectedServiceLog: Service? {
+        projects.lazy.flatMap(\.services).first(where: { $0.id == selectedServiceLogID })
     }
 
     var visibleFollowedCIProjects: [CIMonitoredProject] {
@@ -306,17 +482,41 @@ final class StackHubStore: ObservableObject {
         (pipelineCache[project.id] ?? []).sorted(by: CIActivityOrdering.newestFirst)
     }
 
-    func openSettings(_ request: SettingsRequest = .overview) {
-        tab = .settings
-        settingsRequest = request
-    }
-
     var recentCIActivities: [CIProjectActivity] {
         CIActivityOrdering.latestActivities(projects: accessibleCIProjects, pipelineCache: pipelineCache)
     }
 
-    var isGitHubConnected: Bool {
-        KeychainVault.shared.read(account: "github")?.isEmpty == false
+    func hasGitLabCredential(_ instance: GitLabInstance) -> Bool {
+        gitLabCredentialHosts.contains(instance.host)
+    }
+
+    private func loadCredentialMetadata() {
+        // Older installations do not have the GitHub flag. A saved GitHub
+        // project index is enough to display its previous connection without
+        // prompting for Keychain access on app launch.
+        isGitHubConnected = defaults.bool(forKey: Self.githubConnectedMetadataKey)
+            || accessibleCIProjects.contains(where: { $0.provider == "GitHub Actions" })
+        gitLabCredentialHosts = Set(instances.filter(\.isConnected).map(\.host))
+    }
+
+    /// Reads one Keychain item only when a credential is actually needed. The
+    /// bundle replaces the old per-provider items for new and migrated tokens.
+    private func loadCredentialBundle() -> CredentialBundle {
+        guard !didLoadCredentialBundle else { return credentialBundle }
+        didLoadCredentialBundle = true
+        guard let data = KeychainVault.shared.readData(account: Self.credentialBundleAccount),
+              let decoded = try? JSONDecoder().decode(CredentialBundle.self, from: data) else {
+            return credentialBundle
+        }
+        credentialBundle = decoded
+        return decoded
+    }
+
+    private func saveCredentialBundle(_ bundle: CredentialBundle) throws {
+        let data = try JSONEncoder().encode(bundle)
+        try KeychainVault.shared.save(data: data, account: Self.credentialBundleAccount)
+        credentialBundle = bundle
+        didLoadCredentialBundle = true
     }
 
     func loadPersistedState() {
@@ -366,9 +566,17 @@ final class StackHubStore: ObservableObject {
         let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         do {
-            try KeychainVault.shared.save(token: trimmed, account: "github")
+            var bundle = loadCredentialBundle()
+            bundle.githubAccessToken = trimmed
+            bundle.githubRefreshToken = nil
+            try saveCredentialBundle(bundle)
+            KeychainVault.shared.delete(account: "github")
             KeychainVault.shared.delete(account: "github.refresh")
             UserDefaults.standard.removeObject(forKey: GitHubOAuthConfiguration.accessTokenExpiryKey)
+            githubAccessTokenCache = trimmed
+            githubRefreshTokenCache = nil
+            isGitHubConnected = true
+            defaults.set(true, forKey: Self.githubConnectedMetadataKey)
             invalidateGitHubProjectIndex()
             // The settings page reflects the connected state. Avoid a
             // persistent success toast in the menu-bar footer.
@@ -383,13 +591,25 @@ final class StackHubStore: ObservableObject {
         let trimmed = credential.accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         do {
-            try KeychainVault.shared.save(token: trimmed, account: "github")
+            var bundle = loadCredentialBundle()
+            bundle.githubAccessToken = trimmed
             if let refreshToken = credential.refreshToken, !refreshToken.isEmpty {
-                try KeychainVault.shared.save(token: refreshToken, account: "github.refresh")
+                bundle.githubRefreshToken = refreshToken
+            }
+            try saveCredentialBundle(bundle)
+            KeychainVault.shared.delete(account: "github")
+            KeychainVault.shared.delete(account: "github.refresh")
+            githubAccessTokenCache = trimmed
+            if let refreshToken = credential.refreshToken, !refreshToken.isEmpty {
+                githubRefreshTokenCache = refreshToken
+            } else {
+                githubRefreshTokenCache = nil
             }
             if let expiresIn = credential.expiresIn {
                 UserDefaults.standard.set(Date().addingTimeInterval(TimeInterval(expiresIn)), forKey: GitHubOAuthConfiguration.accessTokenExpiryKey)
             }
+            isGitHubConnected = true
+            defaults.set(true, forKey: Self.githubConnectedMetadataKey)
             invalidateGitHubProjectIndex()
             // The settings page reflects the connected state. Avoid a
             // persistent success toast in the menu-bar footer.
@@ -412,9 +632,23 @@ final class StackHubStore: ObservableObject {
     }
 
     func disconnectGitHub() {
+        do {
+            var bundle = loadCredentialBundle()
+            bundle.githubAccessToken = nil
+            bundle.githubRefreshToken = nil
+            try saveCredentialBundle(bundle)
+        } catch {
+            ciError = error.localizedDescription
+            toast = "GitHub 凭据更新失败"
+            return
+        }
         KeychainVault.shared.delete(account: "github")
         KeychainVault.shared.delete(account: "github.refresh")
         UserDefaults.standard.removeObject(forKey: GitHubOAuthConfiguration.accessTokenExpiryKey)
+        githubAccessTokenCache = nil
+        githubRefreshTokenCache = nil
+        isGitHubConnected = false
+        defaults.set(false, forKey: Self.githubConnectedMetadataKey)
         accessibleCIProjects.removeAll { $0.provider == "GitHub Actions" }
         ciProjects.removeAll { $0.provider == "GitHub Actions" }
         pipelineCache = pipelineCache.filter { key, _ in accessibleCIProjects.contains { $0.id == key } }
@@ -517,7 +751,7 @@ final class StackHubStore: ObservableObject {
                 }
 
                 for instance in self.instances {
-                    guard let token = KeychainVault.shared.read(account: "gitlab:\(instance.host)"), !token.isEmpty else { continue }
+                    guard let token = self.gitLabToken(for: instance) else { continue }
                     do {
                         let client = try GitLabAPIClient(instanceURL: instance.host, token: token, projectIDPrefix: instance.id.uuidString)
                         let mapped: [CIAccessibleProject]
@@ -612,12 +846,47 @@ final class StackHubStore: ObservableObject {
     }
 
     private func githubAccessTokenForRequest() async -> String? {
-        guard let token = KeychainVault.shared.read(account: "github"), !token.isEmpty else { return nil }
+        var bundle = loadCredentialBundle()
+        let storedToken: String?
+        if let cached = githubAccessTokenCache, !cached.isEmpty {
+            storedToken = cached
+        } else if let bundled = bundle.githubAccessToken, !bundled.isEmpty {
+            storedToken = bundled
+        } else if let legacy = KeychainVault.shared.read(account: "github"), !legacy.isEmpty {
+            // Migrate only the token being used. Other legacy entries stay
+            // untouched until their provider is explicitly used.
+            bundle.githubAccessToken = legacy
+            do {
+                try saveCredentialBundle(bundle)
+                KeychainVault.shared.delete(account: "github")
+            } catch { }
+            storedToken = legacy
+        } else {
+            storedToken = nil
+        }
+        guard let token = storedToken, !token.isEmpty else { return nil }
+        githubAccessTokenCache = token
         let expiry = UserDefaults.standard.object(forKey: GitHubOAuthConfiguration.accessTokenExpiryKey) as? Date
-        guard let expiry, expiry < Date().addingTimeInterval(300),
-              let refreshToken = KeychainVault.shared.read(account: "github.refresh"), !refreshToken.isEmpty else {
+        guard let expiry, expiry < Date().addingTimeInterval(300) else {
             return token
         }
+        let storedRefreshToken: String?
+        if let cached = githubRefreshTokenCache, !cached.isEmpty {
+            storedRefreshToken = cached
+        } else if let bundled = bundle.githubRefreshToken, !bundled.isEmpty {
+            storedRefreshToken = bundled
+        } else if let legacy = KeychainVault.shared.read(account: "github.refresh"), !legacy.isEmpty {
+            bundle.githubRefreshToken = legacy
+            do {
+                try saveCredentialBundle(bundle)
+                KeychainVault.shared.delete(account: "github.refresh")
+            } catch { }
+            storedRefreshToken = legacy
+        } else {
+            storedRefreshToken = nil
+        }
+        guard let refreshToken = storedRefreshToken, !refreshToken.isEmpty else { return token }
+        githubRefreshTokenCache = refreshToken
         do {
             let clientID = UserDefaults.standard.string(forKey: GitHubOAuthConfiguration.clientIDKey) ?? GitHubOAuthConfiguration.defaultClientID
             let credential = try await GitHubOAuthClient(session: .shared).refreshAccessToken(clientID: clientID, refreshToken: refreshToken)
@@ -628,6 +897,26 @@ final class StackHubStore: ObservableObject {
             // be surfaced by refreshCI/openPipeline if it has already expired.
             return token
         }
+    }
+
+    private func gitLabToken(for instance: GitLabInstance) -> String? {
+        if let cached = gitLabTokenCache[instance.host], !cached.isEmpty { return cached }
+        var bundle = loadCredentialBundle()
+        if let bundled = bundle.gitLabTokens[instance.host], !bundled.isEmpty {
+            gitLabTokenCache[instance.host] = bundled
+            return bundled
+        }
+        guard let token = KeychainVault.shared.read(account: "gitlab:\(instance.host)"), !token.isEmpty else {
+            gitLabCredentialHosts.remove(instance.host)
+            return nil
+        }
+        bundle.gitLabTokens[instance.host] = token
+        do {
+            try saveCredentialBundle(bundle)
+            KeychainVault.shared.delete(account: "gitlab:\(instance.host)")
+        } catch { }
+        gitLabTokenCache[instance.host] = token
+        return token
     }
 
     private func makePipeline(_ remote: RemotePipeline) -> Pipeline {
@@ -681,7 +970,7 @@ final class StackHubStore: ObservableObject {
                 } else {
                     guard let project = accessibleCIProjects.first(where: { $0.id == pipeline.projectID }),
                           let instance = instances.first(where: { $0.name == project.instanceName }),
-                          let token = KeychainVault.shared.read(account: "gitlab:\(instance.host)") else { throw CIIntegrationError.missingToken }
+                          let token = gitLabToken(for: instance) else { throw CIIntegrationError.missingToken }
                     let pipelineID = pipeline.id.split(separator: "-").last.map(String.init) ?? pipeline.id
                     jobs = try await GitLabAPIClient(instanceURL: instance.host, token: token).jobs(projectID: project.id, pipelineID: pipelineID)
                 }
@@ -717,7 +1006,7 @@ final class StackHubStore: ObservableObject {
                 } else {
                     guard let project = self.accessibleCIProjects.first(where: { $0.id == pipeline.projectID }),
                           let instance = self.instances.first(where: { $0.name == project.instanceName }),
-                          let token = KeychainVault.shared.read(account: "gitlab:\(instance.host)") else { throw CIIntegrationError.missingToken }
+                          let token = self.gitLabToken(for: instance) else { throw CIIntegrationError.missingToken }
                     let jobID = stage.id.split(separator: "-").last.map(String.init) ?? stage.id
                     log = try await GitLabAPIClient(instanceURL: instance.host, token: token).jobLog(projectID: project.id, jobID: jobID)
                 }
@@ -789,8 +1078,24 @@ final class StackHubStore: ObservableObject {
         }
     }
 
+    /// Stop the tracked process and launch a replacement only after the old
+    /// process actually terminates, so the two copies cannot compete for a port.
+    func restartService(_ service: Service) {
+        guard let project = projects.first(where: { $0.services.contains { $0.id == service.id } }) else { return }
+        guard let process = runningProcesses[service.id], process.isRunning else {
+            runningProcesses.removeValue(forKey: service.id)
+            startService(service, in: project)
+            return
+        }
+        restartPendingServiceIDs.insert(service.id)
+        intentionallyStoppingServiceIDs.insert(service.id)
+        updateService(service.id, in: project.id, status: .starting)
+        process.terminate()
+    }
+
     func stopAllServices() {
         guard !runningProcesses.isEmpty else { return }
+        restartPendingServiceIDs.removeAll()
         intentionallyStoppingServiceIDs.formUnion(runningProcesses.keys)
         for process in runningProcesses.values where process.isRunning {
             process.terminate()
@@ -806,6 +1111,10 @@ final class StackHubStore: ObservableObject {
 
     func clearServiceLog(_ service: Service) {
         serviceLogs[service.id] = ""
+    }
+
+    func openServiceLog(_ service: Service) {
+        selectedServiceLogID = service.id
     }
 
     func openService(_ service: Service) {
@@ -849,13 +1158,18 @@ final class StackHubStore: ObservableObject {
             toast = "请填写项目名称、目录和至少一个启动命令"
             return false
         }
+        guard validDrafts.allSatisfy({ ServicePortGuard.hasValidConfiguration($0.ports) }) else {
+            toast = "服务端口须为 1–65535 的逗号分隔列表，或留空"
+            return false
+        }
         let services = validDrafts.map {
             Service(id: UUID().uuidString,
                     name: $0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "服务" : $0.name.trimmingCharacters(in: .whitespacesAndNewlines),
                     command: $0.command.trimmingCharacters(in: .whitespacesAndNewlines),
                     url: $0.url.trimmingCharacters(in: .whitespacesAndNewlines),
                     status: .stopped,
-                    directory: WorkingDirectory.normalizedOverride($0.directory))
+                    directory: WorkingDirectory.normalizedOverride($0.directory),
+                    ports: ServicePortGuard.configuredPorts(from: $0.ports) ?? [])
         }
         let project = Project(id: UUID().uuidString, name: trimmedName, initial: String(trimmedName.prefix(1)).uppercased(), serviceCount: services.count, issue: false, isExpanded: true, services: services, directory: (trimmedDirectory as NSString).expandingTildeInPath)
         projects.append(project)
@@ -877,6 +1191,10 @@ final class StackHubStore: ObservableObject {
             toast = "请填写项目名称、目录和至少一个启动命令"
             return false
         }
+        guard validDrafts.allSatisfy({ ServicePortGuard.hasValidConfiguration($0.ports) }) else {
+            toast = "服务端口须为 1–65535 的逗号分隔列表，或留空"
+            return false
+        }
 
         let services = validDrafts.map { draft in
             let current = project.services.first(where: { $0.id == draft.id })
@@ -886,7 +1204,8 @@ final class StackHubStore: ObservableObject {
                            command: draft.command.trimmingCharacters(in: .whitespacesAndNewlines),
                            url: draft.url.trimmingCharacters(in: .whitespacesAndNewlines),
                            status: current?.status ?? .stopped,
-                           directory: WorkingDirectory.normalizedOverride(draft.directory))
+                           directory: WorkingDirectory.normalizedOverride(draft.directory),
+                           ports: ServicePortGuard.configuredPorts(from: draft.ports) ?? [])
         }
         projects[projectIndex] = Project(id: project.id, name: trimmedName, initial: String(trimmedName.prefix(1)).uppercased(), serviceCount: services.count, issue: project.issue, isExpanded: project.isExpanded, services: services, directory: (trimmedDirectory as NSString).expandingTildeInPath)
         persistCIState()
@@ -909,6 +1228,23 @@ final class StackHubStore: ObservableObject {
             toast = "\(service.name) 的启动目录不存在或不是文件夹：\(directory.path)"
             return
         }
+        updateService(service.id, in: project.id, status: .starting)
+        serviceLogs[service.id] = ""
+        for port in service.ports {
+            do {
+                let releasedPIDs = try ServicePortGuard.release(port: port)
+                if !releasedPIDs.isEmpty {
+                    serviceLogs[service.id, default: ""].append("[StackHub] 端口 \(port) 被 PID \(releasedPIDs.map(String.init).joined(separator: ", ")) 占用，已释放。\n")
+                }
+            } catch {
+                updateService(service.id, in: project.id, status: .failed)
+                let message = "端口 \(port) 无法释放：\(error.localizedDescription)"
+                serviceLogs[service.id] = "[StackHub] \(message)\n"
+                toast = "\(service.name) \(message)"
+                persistCIState()
+                return
+            }
+        }
         let process = Process()
         let pipe = Pipe()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
@@ -918,18 +1254,37 @@ final class StackHubStore: ObservableObject {
         process.currentDirectoryURL = directory
         process.standardOutput = pipe
         process.standardError = pipe
-        updateService(service.id, in: project.id, status: .starting)
-        serviceLogs[service.id] = ""
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        pipe.fileHandleForReading.readabilityHandler = { [weak self, weak process] handle in
             let data = handle.availableData
             guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
-            Task { @MainActor [weak self] in self?.serviceLogs[service.id, default: ""].append(chunk) }
+            Task { @MainActor [weak self, weak process] in
+                guard let self, let process else { return }
+                if let current = self.runningProcesses[service.id], current !== process { return }
+                self.serviceLogs[service.id, default: ""].append(chunk)
+                guard self.runningProcesses[service.id] === process else { return }
+                self.applyStartupEvidence(
+                    from: String((self.serviceLogs[service.id] ?? "").suffix(2_048)),
+                    for: service,
+                    in: project
+                )
+            }
         }
         process.terminationHandler = { [weak self] process in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                pipe.fileHandleForReading.readabilityHandler = nil
                 let wasIntentionallyStopped = self.intentionallyStoppingServiceIDs.remove(service.id) != nil
+                let shouldRestart = self.restartPendingServiceIDs.remove(service.id) != nil
+                if let current = self.runningProcesses[service.id], current !== process {
+                    return
+                }
                 self.runningProcesses.removeValue(forKey: service.id)
+                if shouldRestart {
+                    self.updateService(service.id, in: project.id, status: .starting)
+                    self.persistCIState()
+                    self.startService(service, in: project)
+                    return
+                }
                 let status: ServiceStatus = wasIntentionallyStopped || process.terminationStatus == 0 ? .stopped : .failed
                 self.updateService(service.id, in: project.id, status: status)
                 self.persistCIState()
@@ -938,7 +1293,6 @@ final class StackHubStore: ObservableObject {
         do {
             try process.run()
             runningProcesses[service.id] = process
-            updateService(service.id, in: project.id, status: .running)
         } catch {
             updateService(service.id, in: project.id, status: .failed)
             toast = "启动失败：\(error.localizedDescription)"
@@ -946,6 +1300,7 @@ final class StackHubStore: ObservableObject {
     }
 
     private func stopService(_ service: Service, in project: Project) {
+        restartPendingServiceIDs.remove(service.id)
         if runningProcesses[service.id] != nil {
             intentionallyStoppingServiceIDs.insert(service.id)
         }
@@ -953,6 +1308,25 @@ final class StackHubStore: ObservableObject {
         runningProcesses.removeValue(forKey: service.id)
         updateService(service.id, in: project.id, status: .stopped)
         persistCIState()
+    }
+
+    private func applyStartupEvidence(from log: String, for service: Service, in project: Project) {
+        guard runningProcesses[service.id] != nil,
+              let currentStatus = serviceStatus(service.id, in: project.id),
+              let evidence = ServiceStartupEvidence.classify(log: log) else { return }
+        switch evidence {
+        case .warning:
+            updateService(service.id, in: project.id, status: .warning)
+        case .ready where currentStatus == .starting:
+            updateService(service.id, in: project.id, status: .running)
+        case .ready:
+            break
+        }
+    }
+
+    private func serviceStatus(_ serviceID: String, in projectID: String) -> ServiceStatus? {
+        guard let project = projects.first(where: { $0.id == projectID }) else { return nil }
+        return project.services.first(where: { $0.id == serviceID })?.status
     }
 
     private func updateService(_ serviceID: String, in projectID: String, status: ServiceStatus) {
@@ -975,11 +1349,16 @@ final class StackHubStore: ObservableObject {
         }
         let instance = GitLabInstance(id: UUID(), name: trimmedName, host: endpoint.absoluteString, project: project.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "未选择项目" : project)
         do {
-            try KeychainVault.shared.save(token: trimmedToken, account: "gitlab:\(instance.host)")
+            var bundle = loadCredentialBundle()
+            bundle.gitLabTokens[instance.host] = trimmedToken
+            try saveCredentialBundle(bundle)
+            KeychainVault.shared.delete(account: "gitlab:\(instance.host)")
         } catch {
             toast = "GitLab Token 保存失败"
             return false
         }
+        gitLabCredentialHosts.insert(instance.host)
+        gitLabTokenCache[instance.host] = trimmedToken
         instances.append(instance)
         persistCIState()
         selectedInstanceID = instance.id
@@ -1001,19 +1380,42 @@ final class StackHubStore: ObservableObject {
             toast = "该 GitLab 实例已经添加"
             return false
         }
-        let oldToken = KeychainVault.shared.read(account: "gitlab:\(instance.host)")
+        let hadExistingToken = gitLabCredentialHosts.contains(instance.host)
         let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard instance.host == resolvedHost || !trimmedToken.isEmpty else {
             toast = "地址已变更，请填写新实例的 Access Token"
             return false
         }
-        if instance.host != resolvedHost { KeychainVault.shared.delete(account: "gitlab:\(instance.host)") }
-        let tokenToSave = trimmedToken.isEmpty ? (instance.host == resolvedHost ? oldToken : nil) : trimmedToken
-        if let tokenToSave, !tokenToSave.isEmpty {
-            do { try KeychainVault.shared.save(token: tokenToSave, account: "gitlab:\(resolvedHost)") }
+        let hasTokenAfterSave = !trimmedToken.isEmpty || (instance.host == resolvedHost && hadExistingToken)
+        var bundle = loadCredentialBundle()
+        var shouldSaveBundle = false
+        if instance.host != resolvedHost {
+            bundle.gitLabTokens.removeValue(forKey: instance.host)
+            shouldSaveBundle = true
+        }
+        if !trimmedToken.isEmpty {
+            bundle.gitLabTokens[resolvedHost] = trimmedToken
+            shouldSaveBundle = true
+        } else if !hasTokenAfterSave {
+            bundle.gitLabTokens.removeValue(forKey: resolvedHost)
+            shouldSaveBundle = true
+        }
+        if shouldSaveBundle {
+            do { try saveCredentialBundle(bundle) }
             catch { toast = "GitLab Token 保存失败"; return false }
         }
-        instances[index] = GitLabInstance(id: instance.id, name: resolvedName, host: resolvedHost, project: project.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? instance.project : project, isConnected: tokenToSave?.isEmpty == false)
+        if instance.host != resolvedHost {
+            KeychainVault.shared.delete(account: "gitlab:\(instance.host)")
+            gitLabCredentialHosts.remove(instance.host)
+            gitLabTokenCache.removeValue(forKey: instance.host)
+        }
+        if !trimmedToken.isEmpty {
+            gitLabCredentialHosts.insert(resolvedHost)
+            gitLabTokenCache[resolvedHost] = trimmedToken
+        } else if !hasTokenAfterSave {
+            gitLabCredentialHosts.remove(resolvedHost)
+        }
+        instances[index] = GitLabInstance(id: instance.id, name: resolvedName, host: resolvedHost, project: project.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? instance.project : project, isConnected: hasTokenAfterSave)
         persistCIState()
         toast = "已保存 GitLab 实例"
         return true
@@ -1033,7 +1435,17 @@ final class StackHubStore: ObservableObject {
     }
 
     func removeInstance(_ instance: GitLabInstance) {
+        do {
+            var bundle = loadCredentialBundle()
+            bundle.gitLabTokens.removeValue(forKey: instance.host)
+            try saveCredentialBundle(bundle)
+        } catch {
+            toast = "GitLab 凭据更新失败"
+            return
+        }
         KeychainVault.shared.delete(account: "gitlab:\(instance.host)")
+        gitLabCredentialHosts.remove(instance.host)
+        gitLabTokenCache.removeValue(forKey: instance.host)
         instances.removeAll { $0.id == instance.id }
         accessibleCIProjects.removeAll { $0.instanceName == instance.name }
         ciProjects.removeAll { $0.instanceName == instance.name }
@@ -1047,67 +1459,24 @@ struct StackHubPanel: View {
     @EnvironmentObject private var store: StackHubStore
     @StateObject private var settingsState = SettingsPanelState()
     @StateObject private var githubOAuth = GitHubOAuthController()
+    @State private var selectedDestination: PanelDestination?
     @AppStorage("stackhub.panel.height") private var panelHeight = 640.0
 
     var body: some View {
         ZStack(alignment: .bottom) {
             VStack(spacing: 0) {
-                contentHeader
-                TabStrip(selection: $store.tab)
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 13)
-                if let pipeline = store.selectedPipeline, store.tab == .ci {
-                    // Keep the detail screen outside the page ScrollView so
-                    // the log viewer receives a bounded height and its own
-                    // vertical scroll gesture.
-                    PipelineDetailView(pipeline: pipeline) { store.selectedPipeline = nil }
-                        .id(pipeline.id)
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 16)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                if let service = store.selectedServiceLog {
+                    ServiceLogDetailView(service: service) {
+                        withAnimation(.easeOut(duration: 0.18)) { store.selectedServiceLogID = nil }
+                    }
+                    .id(service.id)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if let destination = selectedDestination {
+                    destinationContent(destination)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
-                    ScrollView {
-                        Group {
-                            switch store.tab {
-                            case .projects: ProjectsView()
-                            case .ci: CIView()
-                            case .settings: SettingsView(state: settingsState, githubOAuth: githubOAuth)
-                            }
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 16)
-                    }
-                    .frame(maxHeight: .infinity)
+                    mainPanelContent
                 }
-                HStack {
-                    Text("StackHub · 菜单栏")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    if store.tab == .projects {
-                        Button { store.openSettings(.addProject) } label: { Label("添加项目", systemImage: "plus") }
-                            .buttonStyle(StackSecondaryButtonStyle())
-                    } else {
-                        Button { store.tab = .settings } label: { Text("设置　⌘ ,") }
-                            .buttonStyle(.plain)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .keyboardShortcut(",", modifiers: .command)
-                    }
-                    Button {
-                        NSApplication.shared.terminate(nil)
-                    } label: {
-                        Label("退出", systemImage: "power")
-                    }
-                    .buttonStyle(StackSecondaryButtonStyle())
-                    .controlSize(.small)
-                    .help("退出 StackHub")
-                    .accessibilityLabel("退出 StackHub")
-                    .keyboardShortcut("q", modifiers: .command)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 11)
-                .overlay(alignment: .top) { Rectangle().fill(.white.opacity(0.08)).frame(height: 1) }
                 PanelResizeHandle(height: $panelHeight)
                     .frame(height: 16)
                     .frame(maxWidth: .infinity)
@@ -1136,12 +1505,71 @@ struct StackHubPanel: View {
         .animation(.easeOut(duration: 0.18), value: store.toast)
     }
 
+    private var mainPanelContent: some View {
+        VStack(spacing: 0) {
+            contentHeader
+            TabStrip(selection: $store.tab)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 13)
+            if let pipeline = store.selectedPipeline, store.tab == .ci {
+                // Keep the detail screen outside the page ScrollView so
+                // the log viewer receives a bounded height and its own
+                // vertical scroll gesture.
+                PipelineDetailView(pipeline: pipeline) { store.selectedPipeline = nil }
+                    .id(pipeline.id)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 16)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            } else {
+                ScrollView {
+                    Group {
+                        switch store.tab {
+                        case .projects:
+                            ProjectsView(
+                                onAddProject: openNewProjectEditor,
+                                onEditProject: openProjectEditor
+                            )
+                        case .ci:
+                            CIView(
+                                onManageGitHub: openGitHubAuthorization,
+                                onAddGitLab: openNewGitLabEditor,
+                                onEditGitLab: openGitLabEditor
+                            )
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 16)
+                }
+                .frame(maxHeight: .infinity)
+            }
+            HStack {
+                Text("StackHub · 菜单栏")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    NSApplication.shared.terminate(nil)
+                } label: {
+                    Label("退出", systemImage: "power")
+                }
+                .buttonStyle(StackSecondaryButtonStyle())
+                .controlSize(.small)
+                .help("退出 StackHub")
+                .accessibilityLabel("退出 StackHub")
+                .keyboardShortcut("q", modifiers: .command)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 11)
+            .overlay(alignment: .top) { Rectangle().fill(.white.opacity(0.08)).frame(height: 1) }
+        }
+    }
+
     private var contentHeader: some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(store.tab == .projects ? "项目" : store.tab == .ci ? "CI 活动" : "设置")
+                Text(store.tab == .projects ? "项目" : "CI 活动")
                     .font(.system(size: 24, weight: .semibold, design: .rounded))
-                Text(store.tab == .projects ? "本地开发堆栈" : store.tab == .ci ? "查看各平台的构建与发布" : "管理本地项目与授权连接")
+                Text(store.tab == .projects ? "本地开发堆栈" : "查看各平台的构建与发布")
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.46))
             }
@@ -1159,48 +1587,49 @@ struct StackHubPanel: View {
         .padding(.bottom, 16)
     }
 
-    private var menuHeader: some View {
-        HStack(alignment: .center, spacing: 10) {
-            Image(systemName: "square.stack.3d.up.fill")
-                .font(.system(size: 22, weight: .medium))
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(.teal, .blue)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("StackHub").font(.system(size: 17, weight: .semibold, design: .rounded))
-                Text("开发工作台").font(.caption2).foregroundStyle(.white.opacity(0.42))
+    @ViewBuilder
+    private func destinationContent(_ destination: PanelDestination) -> some View {
+        switch destination {
+        case .projectEditor:
+            if let draft = settingsState.projectDraft {
+                ProjectEditorDetailView(draft: draft, onClose: closeDestination)
             }
-            Spacer()
-            HStack(spacing: 6) {
-                Circle().fill(.green).frame(width: 7, height: 7)
-                Text("健康").font(.caption2.weight(.medium)).foregroundStyle(.green.opacity(0.9))
+        case .githubAuthorization:
+            GitHubAuthorizationDetailView(oauth: githubOAuth, onClose: closeDestination)
+        case .gitLabEditor:
+            if let draft = settingsState.gitlabDraft {
+                GitLabInstanceDetailView(draft: draft, onClose: closeDestination)
             }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 6)
-            .background(.green.opacity(0.09), in: Capsule())
         }
-        .padding(.horizontal, 18)
-        .padding(.top, 18)
-        .padding(.bottom, 12)
     }
 
-    private var menuFooter: some View {
-        let services = store.projects.flatMap(\.services)
-        let running = services.filter { $0.status == .running }.count
-        return HStack(spacing: 10) {
-            Image(systemName: "bolt.horizontal.fill")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.teal)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(services.isEmpty ? "尚未配置本地服务" : "\(running) / \(services.count) 个服务运行中").font(.caption.weight(.semibold))
-                Text(services.isEmpty ? "添加项目开始使用" : "本机状态").font(.caption2).foregroundStyle(.white.opacity(0.42))
-            }
-            Spacer()
-            Button { store.tab = .settings } label: { Image(systemName: "gearshape.fill").frame(width: 30, height: 30) }
-                .buttonStyle(StackIconButtonStyle())
-        }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 12)
-        .overlay(alignment: .top) { Rectangle().fill(.white.opacity(0.08)).frame(height: 1) }
+    private func openNewProjectEditor() {
+        settingsState.beginNewProject()
+        withAnimation(.easeOut(duration: 0.18)) { selectedDestination = .projectEditor }
+    }
+
+    private func openProjectEditor(_ project: Project) {
+        settingsState.beginEditProject(project)
+        withAnimation(.easeOut(duration: 0.18)) { selectedDestination = .projectEditor }
+    }
+
+    private func openGitHubAuthorization() {
+        withAnimation(.easeOut(duration: 0.18)) { selectedDestination = .githubAuthorization }
+    }
+
+    private func openNewGitLabEditor() {
+        settingsState.beginNewInstance()
+        withAnimation(.easeOut(duration: 0.18)) { selectedDestination = .gitLabEditor }
+    }
+
+    private func openGitLabEditor(_ instance: GitLabInstance) {
+        settingsState.beginEditInstance(instance, hasExistingToken: store.hasGitLabCredential(instance))
+        withAnimation(.easeOut(duration: 0.18)) { selectedDestination = .gitLabEditor }
+    }
+
+    private func closeDestination() {
+        settingsState.cancelEditor()
+        withAnimation(.easeOut(duration: 0.18)) { selectedDestination = nil }
     }
 }
 
@@ -1235,10 +1664,10 @@ struct MenuOverviewView: View {
                     RecommendationCard(
                         icon: "key.fill",
                         title: "连接 CI 账号",
-                        detail: store.isGitHubConnected || !store.instances.isEmpty ? "认证已配置，可刷新流水线" : "在设置中添加 GitHub 或 GitLab",
-                        actionTitle: "打开设置",
+                        detail: store.isGitHubConnected || !store.instances.isEmpty ? "认证已配置，可刷新流水线" : "在 CI 页面中添加 GitHub 或 GitLab",
+                        actionTitle: "前往 CI",
                         accent: .blue
-                    ) { store.tab = .settings }
+                    ) { store.tab = .ci }
                 }
             }
 
@@ -1256,7 +1685,7 @@ struct MenuOverviewView: View {
                     store.tab = .ci
                 }
                 MetricCard(icon: "shippingbox.fill", title: "GitLab 实例", value: "\(store.instances.count)", detail: "已连接", tint: .teal) {
-                    store.tab = .settings
+                    store.tab = .ci
                 }
             }
         }
@@ -1363,22 +1792,23 @@ struct MetricCard: View {
 struct CompactProjectRow: View {
     @EnvironmentObject private var store: StackHubStore
     let project: Project
+    private var state: ProjectRuntimeState { project.runtimeState }
 
     var body: some View {
         Button { store.toggle(project: project) } label: {
             HStack(spacing: 10) {
                 Text(project.initial).font(.system(size: 14, weight: .bold, design: .rounded))
                     .frame(width: 30, height: 30)
-                    .background(project.issue ? .orange.opacity(0.82) : .indigo.opacity(0.9), in: RoundedRectangle(cornerRadius: 8))
+                    .background(state == .issue ? .orange.opacity(0.82) : .indigo.opacity(0.9), in: RoundedRectangle(cornerRadius: 8))
                 VStack(alignment: .leading, spacing: 3) {
                     Text(project.name).font(.subheadline.weight(.medium))
                     Text("\(project.serviceCount) 个服务").font(.caption2).foregroundStyle(.white.opacity(0.46))
                 }
                 Spacer()
                 HStack(spacing: 5) {
-                    ForEach(0..<project.serviceCount, id: \.self) { _ in Circle().fill(project.issue ? .orange : .green).frame(width: 6, height: 6) }
+                    ForEach(0..<project.serviceCount, id: \.self) { _ in Circle().fill(state.color).frame(width: 6, height: 6) }
                 }
-                Text(project.issue ? "有问题" : "健康").font(.caption2.weight(.medium)).foregroundStyle(project.issue ? .orange : .green)
+                Text(state.label).font(.caption2.weight(.medium)).foregroundStyle(state.color)
                 Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.white.opacity(0.3))
             }
             .padding(.horizontal, 12)
@@ -1414,15 +1844,41 @@ struct CompactCIBadge: View {
 
 struct ProjectsView: View {
     @EnvironmentObject private var store: StackHubStore
+    let onAddProject: () -> Void
+    let onEditProject: (Project) -> Void
+    @State private var deletingProject: Project?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            SectionLabel(title: "项目", trailing: "\(store.projects.count) 个项目 · \(store.projects.flatMap(\.services).count) 个服务")
-            if store.projects.isEmpty {
-                EmptyStateCard(icon: "folder.badge.plus", title: "还没有本地项目", detail: "点击底部“添加项目”，配置工作目录和服务。")
-            } else {
-                ForEach(store.projects) { project in ProjectCard(project: project) }
+            HStack(alignment: .firstTextBaseline) {
+                SectionLabel(title: "项目", trailing: "\(store.projects.count) 个项目 · \(store.projects.flatMap(\.services).count) 个服务")
+                Spacer()
+                Button(action: onAddProject) {
+                    Label("添加项目", systemImage: "plus")
+                }
+                .buttonStyle(StackSecondaryButtonStyle())
+                .controlSize(.small)
             }
+            if store.projects.isEmpty {
+                EmptyStateCard(icon: "folder.badge.plus", title: "还没有本地项目", detail: "点击“添加项目”，配置工作目录和服务。")
+            } else {
+                ForEach(store.projects) { project in
+                    ProjectCard(
+                        project: project,
+                        onEdit: { onEditProject(project) },
+                        onDelete: { deletingProject = project }
+                    )
+                }
+            }
+        }
+        .alert("移除本地项目？", isPresented: Binding(get: { deletingProject != nil }, set: { if !$0 { deletingProject = nil } })) {
+            Button("移除项目", role: .destructive) {
+                if let project = deletingProject { store.removeProject(project) }
+                deletingProject = nil
+            }
+            Button("取消", role: .cancel) { deletingProject = nil }
+        } message: {
+            Text("只移除 StackHub 配置，不会删除磁盘上的项目文件。")
         }
     }
 }
@@ -1430,10 +1886,14 @@ struct ProjectsView: View {
 struct ProjectCard: View {
     @EnvironmentObject private var store: StackHubStore
     let project: Project
+    let onEdit: () -> Void
+    let onDelete: () -> Void
     private var projectIsRunning: Bool {
-        project.services.contains { service in
-            service.status == .running || service.status == .starting
-        }
+        project.services.contains { $0.status.hasManagedProcess }
+    }
+    private var state: ProjectRuntimeState { project.runtimeState }
+    private var verifiedServiceCount: Int {
+        project.services.filter { $0.status == .running }.count
     }
 
     var body: some View {
@@ -1444,14 +1904,14 @@ struct ProjectCard: View {
                     Text(project.initial)
                         .font(.system(size: 16, weight: .bold, design: .rounded))
                         .frame(width: 34, height: 34)
-                        .background(project.issue ? Color.orange.opacity(0.8) : Color.indigo.opacity(0.85), in: RoundedRectangle(cornerRadius: 10))
+                        .background(state == .issue ? Color.orange.opacity(0.8) : Color.indigo.opacity(0.85), in: RoundedRectangle(cornerRadius: 10))
                     VStack(alignment: .leading, spacing: 3) {
                         Text(project.name).font(.subheadline.weight(.semibold))
-                        Text("\(project.serviceCount) 个服务运行中").font(.caption2).foregroundStyle(.secondary)
+                        Text("\(verifiedServiceCount) / \(project.serviceCount) 个服务已就绪").font(.caption2).foregroundStyle(.secondary)
                     }
                     Spacer(minLength: 8)
-                    Label(project.issue ? "有问题" : "健康", systemImage: "circle.fill")
-                        .font(.caption2).foregroundStyle(project.issue ? .orange : .green)
+                    Label(state.label, systemImage: "circle.fill")
+                        .font(.caption2).foregroundStyle(state.color)
                         .labelStyle(.titleAndIcon)
                     Image(systemName: "chevron.down")
                         .font(.caption)
@@ -1462,10 +1922,31 @@ struct ProjectCard: View {
                 }
                 .buttonStyle(.plain)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                Button(projectIsRunning ? "停止" : "启动") {
-                    store.projectAction(project, action: projectIsRunning ? "停止" : "启动")
+                Button(action: onEdit) {
+                    Image(systemName: "pencil")
+                        .frame(width: 28, height: 28)
                 }
-                .buttonStyle(ProjectActionButtonStyle(tint: projectIsRunning ? .red : .green))
+                .buttonStyle(StackIconButtonStyle())
+                .help("编辑项目")
+                .accessibilityLabel("编辑 \(project.name)")
+                Button(action: onDelete) {
+                    Image(systemName: "trash")
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(StackIconButtonStyle())
+                .help("移除项目")
+                .accessibilityLabel("移除 \(project.name)")
+                if projectIsRunning {
+                    Button("停止") {
+                        store.projectAction(project, action: "停止")
+                    }
+                    .buttonStyle(ProjectActionButtonStyle(tint: .red))
+                } else {
+                    Button("启动") {
+                        store.projectAction(project, action: "启动")
+                    }
+                    .buttonStyle(StackSecondaryButtonStyle())
+                }
             }
             .padding(12)
             if project.isExpanded {
@@ -1484,7 +1965,6 @@ struct ProjectCard: View {
 struct ServiceRow: View {
     @EnvironmentObject private var store: StackHubStore
     let service: Service
-    @State private var isShowingLog = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1492,43 +1972,43 @@ struct ServiceRow: View {
                 Circle().fill(service.status.color).frame(width: 9, height: 9)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(service.name).font(.subheadline)
+                    Text(service.status.label)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(service.status.color)
                     Text(service.command).font(.caption2).foregroundStyle(.secondary)
                     Text(service.directory.map { $0.isEmpty ? "目录：项目工作目录" : "目录：\($0)" } ?? "目录：项目工作目录")
                         .font(.caption2).foregroundStyle(.secondary)
+                    if !service.ports.isEmpty {
+                        Text("端口：\(service.ports.map(String.init).joined(separator: ", "))（启动前自动释放占用）")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
                     Text(service.url).font(.caption2).foregroundStyle(.secondary)
                 }
                 Spacer()
                 HStack(spacing: 5) {
                     Button {
-                        withAnimation(.easeOut(duration: 0.16)) { isShowingLog.toggle() }
+                        withAnimation(.easeOut(duration: 0.18)) { store.openServiceLog(service) }
                     } label: {
-                        Image(systemName: isShowingLog ? "doc.text.fill" : "doc.text")
+                        Image(systemName: "doc.text")
                             .frame(width: 28, height: 28)
                     }
                     .buttonStyle(StackIconButtonStyle())
-                    .help("查看日志")
-                    .accessibilityLabel(isShowingLog ? "关闭日志" : "查看日志")
+                    .help("打开日志")
+                    .accessibilityLabel("打开日志")
                     SmallIconButton(systemName: "arrow.up.right") { store.openService(service) }
-                    SmallIconButton(systemName: "arrow.clockwise") { store.serviceAction(service) }
-                    SmallIconButton(systemName: service.status == .running ? "stop.fill" : "play.fill") { store.serviceAction(service) }
+                    SmallIconButton(systemName: "arrow.clockwise") { store.restartService(service) }
+                        .help("重启服务")
+                    SmallIconButton(systemName: service.status.hasManagedProcess ? "stop.fill" : "play.fill") { store.serviceAction(service) }
                 }
             }
             .padding(.vertical, 8)
             .padding(.horizontal, 7)
-            if isShowingLog {
-                ServiceLogView(service: service) {
-                    withAnimation(.easeOut(duration: 0.16)) { isShowingLog = false }
-                }
-                .padding(.horizontal, 7)
-                .padding(.bottom, 8)
-                .transition(.opacity.combined(with: .move(edge: .top)))
-            }
         }
         .overlay(alignment: .top) { Divider().opacity(0.35) }
     }
 }
 
-struct ServiceLogView: View {
+struct ServiceLogDetailView: View {
     @EnvironmentObject private var store: StackHubStore
     let service: Service
     let onClose: () -> Void
@@ -1546,49 +2026,82 @@ struct ServiceLogView: View {
         log.isEmpty ? 0 : log.split(separator: "\n", omittingEmptySubsequences: false).count
     }
 
-    private var displayedLog: String {
-        log.isEmpty ? "服务尚未输出日志。启动后 stdout/stderr 会实时显示。" : log
-    }
-
-    private var displayedLogColor: Color {
-        log.isEmpty ? Color.secondary : Color.white.opacity(0.88)
+    private var displayedLog: AttributedString {
+        guard !log.isEmpty else {
+            var placeholder = AttributedString("服务尚未输出日志。启动后 stdout/stderr 会实时显示。")
+            placeholder.foregroundColor = .secondary
+            return placeholder
+        }
+        return ANSILogRenderer.attributedString(from: log)
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 7) {
+        VStack(spacing: 0) {
+            HStack(spacing: 11) {
+                Button(action: onClose) {
+                    Label("返回", systemImage: "chevron.left")
+                }
+                .buttonStyle(StackSecondaryButtonStyle())
+                .controlSize(.small)
+                .accessibilityLabel("返回项目")
+
                 Image(systemName: "terminal")
+                    .font(.title3)
                     .foregroundStyle(.teal)
-                Text("运行日志").font(.caption.weight(.semibold))
-                Text(lineCount == 0 ? "暂无输出" : "\(lineCount) 行")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("运行日志").font(.subheadline.weight(.semibold))
+                    Text("\(service.name) · \(lineCount == 0 ? "暂无输出" : "\(lineCount) 行")")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
+                Label(service.status.label, systemImage: "circle.fill")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(service.status.color)
+                    .labelStyle(.titleAndIcon)
+
+                Button {
+                    store.serviceAction(service)
+                } label: {
+                    Image(systemName: "play.fill")
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(StackIconButtonStyle())
+                .disabled(service.status.hasManagedProcess)
+                .accessibilityLabel("启动服务")
+                .help(service.status.hasManagedProcess ? "服务正在运行" : "启动服务")
+
+                Button {
+                    store.restartService(service)
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(StackIconButtonStyle())
+                .accessibilityLabel("重启服务")
+                .help("重启服务")
                 Button("清空") { store.clearServiceLog(service) }
                     .buttonStyle(.plain)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .disabled(log.isEmpty)
-                Button("关闭", action: onClose)
-                    .buttonStyle(.plain)
-                    .font(.caption2)
-                    .foregroundStyle(.teal)
             }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .overlay(alignment: .bottom) { Rectangle().fill(.white.opacity(0.08)).frame(height: 1) }
+
             ScrollView(.vertical, showsIndicators: true) {
                 Text(displayedLog)
                     .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(displayedLogColor)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
+                    .padding(16)
             }
-            .frame(height: 132)
-            .background(Color.black.opacity(0.26), in: RoundedRectangle(cornerRadius: 9))
-            .overlay(RoundedRectangle(cornerRadius: 9).stroke(.white.opacity(0.08)))
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.black.opacity(0.26))
         }
-        .padding(9)
-        .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(.white.opacity(0.08)))
+        .background(Color(red: 0.055, green: 0.075, blue: 0.12))
+        .closesOnEscape(perform: onClose)
     }
 }
 
@@ -1596,11 +2109,19 @@ struct ServiceLogView: View {
 
 struct CIView: View {
     @EnvironmentObject private var store: StackHubStore
+    let onManageGitHub: () -> Void
+    let onAddGitLab: () -> Void
+    let onEditGitLab: (GitLabInstance) -> Void
     @State private var expandedProjectID: String?
     @State private var isAddingFollow = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            CIConnectionsSection(
+                onManageGitHub: onManageGitHub,
+                onAddGitLab: onAddGitLab,
+                onEditGitLab: onEditGitLab
+            )
             SectionLabel(title: "关注项目", trailing: "与本地项目独立")
             if store.visibleFollowedCIProjects.isEmpty {
                 EmptyStateCard(icon: "eye.slash", title: "还没有关注项目", detail: "在下方流水线列表中点击“关注项目”即可添加。")
