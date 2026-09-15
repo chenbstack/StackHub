@@ -217,8 +217,10 @@ final class CIActivityOrderingTests: XCTestCase {
     func testPrefetchPublishesEachSuccessBeforeALaterRequestFails() async throws {
         let first = project("github:owner/first")
         let second = project("github:owner/second")
-        let candidates = [(first.id, pipeline("github-1", project: first, timestamp: 200)),
-                          (second.id, pipeline("github-2", project: second, timestamp: 100))]
+        let candidates: [(String, Pipeline)] = [
+            (first.id, pipeline("github-1", project: first, timestamp: 200)),
+            (second.id, pipeline("github-2", project: second, timestamp: 100))
+        ]
         var published: [String: Pipeline] = [:]
         do {
             _ = try await prefetchPipelineStages(candidates: candidates, limit: 8, onLoad: { projectID, loaded in
