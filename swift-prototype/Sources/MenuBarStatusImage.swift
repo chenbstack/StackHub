@@ -6,7 +6,7 @@ enum MenuBarStatusImage {
     static func make(running: Int, failures: Int) -> NSImage {
         let labels = [running > 0 ? "RUN \(running)" : nil, failures > 0 ? "FAIL \(failures)" : nil].compactMap { $0 }
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 6.5, weight: .medium),
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 7, weight: .medium),
             .foregroundColor: NSColor.white,
             .kern: -0.15
         ]

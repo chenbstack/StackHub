@@ -103,6 +103,10 @@ final class StackHubAppDelegate: NSObject, NSApplicationDelegate {
         panel.setFrameOrigin(NSPoint(x: originX, y: originY))
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
+        // The panel is reused, so reopening it does not fire SwiftUI onAppear.
+        // Acknowledge unread failures on every successful presentation.
+        store.acknowledgeCIFailures()
+        updateStatusItem()
     }
 
     private func installPopoverDismissMonitors() {
@@ -610,7 +614,7 @@ final class StackHubStore: ObservableObject {
     /// in-flight set separate from the refresh cursor so opening a long list
     /// never creates duplicate per-pipeline requests.
     private var hydratingGitLabPipelineTimingIDs: Set<String> = []
-    /// Failures remain visible in the menu bar until the CI screen has been
+    /// Failures remain visible in the menu bar until the panel has been
     /// opened. Persist this small acknowledgement set so a relaunch does not
     /// re-notify failures the user has already seen.
     @Published private(set) var acknowledgedFailedPipelineIDs: Set<String> = []
@@ -995,6 +999,11 @@ final class StackHubStore: ObservableObject {
             }
         }
         pipelineCache = updatedCache
+        if let selected = selectedPipeline,
+           source.contains(projectID: selected.projectID),
+           let refreshed = updatedCache[selected.projectID]?.first(where: { $0.id == selected.id }) {
+            selectedPipeline = refreshed
+        }
         reconcileAcknowledgedFailures()
         lastCIRefresh = Date()
     }
@@ -1034,10 +1043,9 @@ final class StackHubStore: ObservableObject {
             var githubProjects = cachedGitHubProjects
             do {
                 let client = GitHubAPIClient(token: token, session: ciSession)
-                // GitHub's repository list supports `since`, so only
-                // repositories changed since the previous sync need an
-                // Actions-runs request. Keep the first sync and an
-                // explicit force refresh bounded to the recent scope.
+                // Keep repository discovery incremental. Actions status uses
+                // its own polling below because completing or rerunning a
+                // workflow need not update the repository's timestamp.
                 let fullDiscovery = forceProjectDiscovery || lastGitHubRepositorySync == nil || cachedGitHubProjects.isEmpty ||
                     lastGitHubFullDiscovery.map { Date().timeIntervalSince($0) > Self.githubFullDiscoveryInterval } ?? true
                 let discovered = try await profiler.measure("GitHub · 仓库索引", requests: 1) {
@@ -1065,15 +1073,9 @@ final class StackHubStore: ObservableObject {
                 }
                 projects = githubProjects
 
-                let projectsToRefresh: [CIAccessibleProject]
-                if fullDiscovery {
-                    projectsToRefresh = githubProjects
-                } else {
-                    projectsToRefresh = CIActivityOrdering.projectsRequiringPipelineRefresh(
-                        changed: changed,
-                        retained: githubProjects
-                    )
-                }
+                let projectsToRefresh = CIActivityOrdering.projectsRequiringPipelineRefresh(
+                    retained: githubProjects, pipelineCache: pipelines
+                )
                 // Requests within this account stay serial; other accounts
                 // refresh in their own main-actor tasks.
                 var didFetchAllChangedPipelines = true
@@ -1541,18 +1543,26 @@ final class StackHubStore: ObservableObject {
                     let parts = pipeline.repository.split(separator: "/", maxSplits: 1).map(String.init)
                     let runID = pipeline.id.split(separator: "-").last.map(String.init) ?? pipeline.id
                     guard parts.count == 2 else { throw CIIntegrationError.invalidURL }
-                    jobs = try await GitHubAPIClient(token: token).jobs(owner: parts[0], repository: parts[1], runID: runID)
+                    jobs = try await GitHubAPIClient(token: token, session: ciSession).jobs(owner: parts[0], repository: parts[1], runID: runID)
                 } else {
                     guard let project = accessibleCIProjects.first(where: { $0.id == pipeline.projectID }),
                           let instance = instances.first(where: { $0.name == project.instanceName }),
                           let token = gitLabToken(for: instance) else { throw CIIntegrationError.missingToken }
                     let pipelineID = pipeline.id.split(separator: "-").last.map(String.init) ?? pipeline.id
-                    jobs = try await GitLabAPIClient(instanceURL: instance.host, token: token).jobs(projectID: project.id, pipelineID: pipelineID)
+                    jobs = try await GitLabAPIClient(instanceURL: instance.host, token: token, session: ciSession).jobs(projectID: project.id, pipelineID: pipelineID)
                 }
 
-                guard let detailed = CIPipelineCache.withJobs(pipeline, jobs: jobs) else { return }
+                // Jobs may return after the summary refresh has completed.
+                // Attach them to the live pipeline, retaining its current
+                // overall status and duration rather than the opening snapshot.
+                let selected = self.selectedPipeline.flatMap {
+                    $0.id == pipeline.id && $0.projectID == pipeline.projectID ? $0 : nil
+                }
+                guard let current = self.pipelineCache[pipeline.projectID]?.first(where: { $0.id == pipeline.id }) ?? selected,
+                      let staged = CIPipelineCache.withJobs(current, jobs: jobs) else { return }
+                let detailed = CIPipelineCache.merging(staged, with: current)
                 self.pipelineCache[pipeline.projectID] = self.pipelineCache[pipeline.projectID]?.map { $0.id == pipeline.id ? detailed : $0 }
-                if self.selectedPipeline?.id == pipeline.id { self.selectedPipeline = detailed }
+                if selected != nil { self.selectedPipeline = detailed }
             } catch {
                 self.ciError = error.localizedDescription
             }

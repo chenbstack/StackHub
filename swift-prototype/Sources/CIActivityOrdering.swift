@@ -71,13 +71,16 @@ enum CIActivityOrdering {
             .map { $0 }
     }
 
-    /// A changed repository can be queried for Actions runs only if it stays
-    /// inside the current bounded dashboard scope.
+    /// Actions can start, finish, or rerun without changing repository metadata.
+    /// Poll the bounded dashboard scope every cycle, prioritizing active runs.
     static func projectsRequiringPipelineRefresh(
-        changed: [CIAccessibleProject],
-        retained: [CIAccessibleProject]
+        retained: [CIAccessibleProject],
+        pipelineCache: [String: [Pipeline]]
     ) -> [CIAccessibleProject] {
-        let retainedIDs = Set(retained.map(\.id))
-        return changed.filter { retainedIDs.contains($0.id) }
+        let projects = uniqueProjects(retained)
+        let runningIDs = Set(projects.compactMap { project in
+            pipelineCache[project.id]?.contains { $0.state == .running } == true ? project.id : nil
+        })
+        return projects.filter { runningIDs.contains($0.id) } + projects.filter { !runningIDs.contains($0.id) }
     }
 }

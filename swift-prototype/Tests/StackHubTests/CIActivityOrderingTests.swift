@@ -121,7 +121,7 @@ final class CIActivityOrderingTests: XCTestCase {
         XCTAssertEqual(projects.first?.name, newest.name)
     }
 
-    func testIncrementalGitHubMergeRefreshesOnlyChangedProjectsInRetainedScope() {
+    func testIncrementalGitHubMergeRetainsOnlyBoundedRepositoryScope() {
         let cachedOld = project("github:owner/old", timestamp: 100)
         let cachedChanged = project("github:owner/changed", timestamp: 200)
         let changed = project("github:owner/changed", name: "Changed metadata", timestamp: 400)
@@ -133,13 +133,24 @@ final class CIActivityOrderingTests: XCTestCase {
             limit: 2
         )
         let refresh = CIActivityOrdering.projectsRequiringPipelineRefresh(
-            changed: [changed, newlyRecent],
-            retained: retained
+            retained: retained, pipelineCache: [:]
         )
 
         XCTAssertEqual(retained.map(\.id), [newlyRecent.id, changed.id])
         XCTAssertEqual(retained.last?.name, "Changed metadata")
-        XCTAssertEqual(refresh.map(\.id), [changed.id, newlyRecent.id])
+        XCTAssertEqual(refresh.map(\.id), [newlyRecent.id, changed.id])
+    }
+
+    func testActionsPollIncludesUnchangedRepositoriesAndPrioritizesRunningOnes() {
+        let idle = project("github:owner/idle")
+        let active = project("github:owner/active")
+        let running = Pipeline(id: "github-1", projectID: active.id, provider: active.provider,
+                               repository: active.repository, branch: "main", commit: "", duration: "0 sec",
+                               state: .running, stages: [], updatedAt: nil, webURL: nil)
+        let refresh = CIActivityOrdering.projectsRequiringPipelineRefresh(
+            retained: [idle, active, idle], pipelineCache: [active.id: [running]]
+        )
+        XCTAssertEqual(refresh.map(\.id), [active.id, idle.id])
     }
 
     func testSamePipelineIDFromDifferentGitLabInstancesDoesNotMergeCards() {

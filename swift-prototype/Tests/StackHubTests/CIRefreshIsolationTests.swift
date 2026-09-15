@@ -149,6 +149,103 @@ final class CIRefreshIsolationTests: XCTestCase {
     }
 
     @MainActor
+    func testGitHubCompletionRefreshesWithoutRepositoryChangeAndLateJobsCannotRestoreRunning() async throws {
+        let fixture = makeFixture(instances: [], githubToken: "test-token")
+        defer { fixture.cleanUp() }
+        fixture.router.respond { request in
+            if request.url!.path == "/user/repos" { return .json(self.githubRepositoryJSON) }
+            return .json(self.githubRunsJSON(status: "in_progress", conclusion: nil))
+        }
+        fixture.store.refreshCI()
+        try await eventually { !fixture.store.isRefreshingCI }
+        let projectID = "github:owner/example"
+        let running = try XCTUnwrap(fixture.store.pipelineCache[projectID]?.first)
+        XCTAssertEqual(running.state, .running)
+        XCTAssertEqual(fixture.store.menuBarPipelineStatus.running, 1)
+
+        fixture.router.respond { request in
+            switch request.url!.path {
+            case "/user/repos": return .json("[]")
+            case "/repos/owner/example/actions/runs": return .json(self.githubRunsJSON(status: "completed", conclusion: "success"))
+            default: return .hold
+            }
+        }
+        fixture.store.openPipeline(running)
+        try await eventually { fixture.router.requests.contains { $0.url!.path.hasSuffix("/jobs") } }
+        fixture.store.refreshCI()
+        try await eventually { !fixture.store.isRefreshingCI }
+        XCTAssertEqual(fixture.store.pipelineCache[projectID]?.first?.state, .success)
+        XCTAssertEqual(fixture.store.menuBarPipelineStatus.running, 0)
+        XCTAssertEqual(fixture.store.selectedPipeline?.state, .success)
+        XCTAssertNotEqual(fixture.store.pipelineCache[projectID]?.first?.duration, running.duration)
+        XCTAssertTrue(fixture.router.requests.contains {
+            $0.url!.path == "/user/repos" && URLComponents(url: $0.url!, resolvingAgainstBaseURL: false)?.queryItems?.contains { $0.name == "since" } == true
+        }, "Completion must refresh on the incremental path as well")
+
+        fixture.router.releaseHeld(host: "api.github.com", result: .json("""
+        {"jobs":[{"id":1,"name":"Build","status":"completed","conclusion":"success"}]}
+        """))
+        try await eventually { fixture.store.pipelineCache[projectID]?.first?.hasLoadedStages == true }
+        XCTAssertEqual(fixture.store.pipelineCache[projectID]?.first?.state, .success)
+        XCTAssertEqual(fixture.store.selectedPipeline?.state, .success)
+        XCTAssertEqual(fixture.store.menuBarPipelineStatus.running, 0)
+        XCTAssertEqual(fixture.store.pipelineCache[projectID]?.first?.stages.first?.state, .success)
+    }
+
+    @MainActor
+    func testGitHubRerunIsDiscoveredWithoutRepositoryChange() async throws {
+        let fixture = makeFixture(instances: [], githubToken: "test-token")
+        defer { fixture.cleanUp() }
+        fixture.router.respond { request in
+            request.url!.path == "/user/repos" ? .json(self.githubRepositoryJSON) : .json(self.githubRunsJSON(status: "completed", conclusion: "success"))
+        }
+        fixture.store.refreshCI()
+        try await eventually { !fixture.store.isRefreshingCI }
+        XCTAssertEqual(fixture.store.menuBarPipelineStatus.running, 0)
+
+        fixture.router.respond { request in
+            request.url!.path == "/user/repos" ? .json("[]") : .json(self.githubRunsJSON(status: "in_progress", conclusion: nil))
+        }
+        fixture.store.refreshCI()
+        try await eventually { !fixture.store.isRefreshingCI }
+        XCTAssertEqual(fixture.store.pipelineCache["github:owner/example"]?.first?.state, .running)
+        XCTAssertEqual(fixture.store.menuBarPipelineStatus.running, 1)
+    }
+
+    @MainActor
+    func testGitHubFailedConclusionReplacesRunningAndUpdatesMenuCount() async throws {
+        let fixture = makeFixture(instances: [], githubToken: "test-token")
+        defer { fixture.cleanUp() }
+        fixture.router.respond { request in
+            request.url!.path == "/user/repos" ? .json(self.githubRepositoryJSON) : .json(self.githubRunsJSON(status: "in_progress", conclusion: nil))
+        }
+        fixture.store.refreshCI()
+        try await eventually { !fixture.store.isRefreshingCI }
+        fixture.router.respond { request in
+            request.url!.path == "/user/repos" ? .json("[]") : .json(self.githubRunsJSON(status: "completed", conclusion: "failure"))
+        }
+        fixture.store.refreshCI()
+        try await eventually { !fixture.store.isRefreshingCI }
+        XCTAssertEqual(fixture.store.pipelineCache["github:owner/example"]?.first?.state, .failed)
+        XCTAssertEqual(fixture.store.menuBarPipelineStatus.running, 0)
+        XCTAssertEqual(fixture.store.menuBarPipelineStatus.unreadFailures, 1)
+    }
+
+    private var githubRepositoryJSON: String {
+        """
+        [{"name":"example","full_name":"owner/example","default_branch":"main","updated_at":"2026-09-15T10:00:00Z"}]
+        """
+    }
+
+    private func githubRunsJSON(status: String, conclusion: String?) -> String {
+        let result = conclusion.map { "\"\($0)\"" } ?? "null"
+        let updatedAt = conclusion == nil ? "2026-09-15T10:00:00Z" : "2026-09-15T10:02:00Z"
+        return """
+        {"workflow_runs":[{"id":1,"status":"\(status)","conclusion":\(result),"head_branch":"main","head_sha":"abcdef123","updated_at":"\(updatedAt)","run_started_at":"2026-09-15T10:00:00Z"}]}
+        """
+    }
+
+    @MainActor
     func testAutomaticScheduleIsIndependentAndRecoveryClearsBackoff() throws {
         var now = Date(timeIntervalSince1970: 1_000)
         let scheduler = CIRefreshScheduler(now: { now })
