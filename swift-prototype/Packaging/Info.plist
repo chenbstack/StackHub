@@ -8,6 +8,8 @@
     <string>StackHub</string>
     <key>CFBundleExecutable</key>
     <string>StackHub</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.stackhub.prototype</string>
     <key>CFBundleInfoDictionaryVersion</key>

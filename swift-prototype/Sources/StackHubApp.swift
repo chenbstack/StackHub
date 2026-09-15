@@ -35,20 +35,7 @@ final class StackHubAppDelegate: NSObject, NSApplicationDelegate {
 
         button.target = self
         button.action = #selector(togglePanel(_:))
-        let iconConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
-            .applying(NSImage.SymbolConfiguration(paletteColors: [.white]))
-        button.image = NSImage(
-            systemSymbolName: "square.stack.3d.up.fill",
-            accessibilityDescription: "StackHub"
-        )?.withSymbolConfiguration(iconConfiguration)
-        // A template image is recolored by AppKit's status-bar appearance.
-        // Keep this rendered white symbol non-template so it remains legible
-        // over the user's light, translucent menu bar.
-        button.image?.isTemplate = false
         button.imagePosition = .imageOnly
-        // Match the menu-bar template convention used by the surrounding
-        // status icons instead of adapting to the desktop wallpaper's light
-        // appearance, which can otherwise render the icon black.
         button.contentTintColor = nil
         button.toolTip = "StackHub"
         statusItem = item
@@ -83,35 +70,12 @@ final class StackHubAppDelegate: NSObject, NSApplicationDelegate {
     private func updateStatusItem() {
         guard let statusItem, let button = statusItem.button else { return }
         let status = store.menuBarPipelineStatus
-        let lines = [
-            status.running > 0 ? "RUN \(status.running)" : nil,
-            status.unreadFailures > 0 ? "FAIL \(status.unreadFailures)" : nil
-        ].compactMap { $0 }
-        let title = lines.joined(separator: "\n")
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 6, weight: .medium)
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.minimumLineHeight = 6
-        paragraph.maximumLineHeight = 6
-        paragraph.lineSpacing = -1
-        paragraph.alignment = .left
-        button.attributedTitle = NSAttributedString(
-            string: title,
-            attributes: [
-                .font: font,
-                .foregroundColor: NSColor.white,
-                .paragraphStyle: paragraph,
-                .kern: -0.15
-            ]
-        )
-        button.font = font
-        button.imagePosition = title.isEmpty ? .imageOnly : .imageLeft
-
-        let textWidth = (title as NSString).boundingRect(
-            with: NSSize(width: 80, height: 24),
-            options: [.usesLineFragmentOrigin, .usesFontLeading],
-            attributes: [.font: font, .paragraphStyle: paragraph]
-        ).width
-        statusItem.length = ceil(title.isEmpty ? 22 : 22 + textWidth + 6)
+        let image = MenuBarStatusImage.make(running: status.running, failures: status.unreadFailures)
+        button.attributedTitle = NSAttributedString(string: "")
+        button.image = image
+        button.imagePosition = .imageOnly
+        button.setAccessibilityLabel(image.accessibilityDescription)
+        statusItem.length = image.size.width + 4
     }
 
     @objc private func togglePanel(_ sender: Any?) {

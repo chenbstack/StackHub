@@ -25,6 +25,7 @@ mkdir -p "$app_path/Contents/MacOS" "$app_path/Contents/Resources" "$app_path/Co
 cp "$binary_dir/StackHub" "$app_path/Contents/MacOS/StackHub"
 cp Packaging/Info.plist "$app_path/Contents/Info.plist"
 ditto Sources/Localization "$app_path/Contents/Resources"
+cp Packaging/AppIcon.icns "$app_path/Contents/Resources/AppIcon.icns"
 # ditto preserves the framework's versioned symlinks and helper permissions.
 ditto "$sparkle_framework" "$app_path/Contents/Frameworks/Sparkle.framework"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$app_path/Contents/Info.plist"
