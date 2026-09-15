@@ -4,18 +4,44 @@ import XCTest
 
 final class CIActivityOrderingTests: XCTestCase {
     func testExecutionDurationFormattingIsCompactAndProviderIndependent() {
+        withAppLanguage(.simplifiedChinese) {
         XCTAssertEqual(CIExecutionTimeFormatter.duration(seconds: 0), "0 秒")
         XCTAssertEqual(CIExecutionTimeFormatter.duration(seconds: 125.4), "2 分 5 秒")
         XCTAssertEqual(CIExecutionTimeFormatter.duration(seconds: 3660), "1 小时 1 分钟")
         XCTAssertEqual(CIExecutionTimeFormatter.duration(seconds: nil), "—")
+        }
     }
 
     func testExecutionDurationCanBeDerivedFromRunDates() {
+        withAppLanguage(.simplifiedChinese) {
         let start = Date(timeIntervalSince1970: 100)
         let end = Date(timeIntervalSince1970: 218)
 
         XCTAssertEqual(CIExecutionTimeFormatter.duration(from: start, to: end), "1 分 58 秒")
         XCTAssertEqual(CIExecutionTimeFormatter.duration(from: start, to: nil), "—")
+        }
+    }
+
+    func testEnglishLocalizationUsesBundledResources() {
+        withAppLanguage(.english) {
+            XCTAssertEqual(L("项目"), "Projects")
+            XCTAssertEqual(CIExecutionTimeFormatter.duration(seconds: 125.4), "2 min 5 sec")
+            XCTAssertEqual(ServiceStatus.warning.label, "Warning")
+        }
+    }
+
+    private func withAppLanguage(_ language: AppLanguage, perform body: () -> Void) {
+        let defaults = UserDefaults.standard
+        let previous = defaults.string(forKey: AppLanguage.storageKey)
+        defaults.set(language.rawValue, forKey: AppLanguage.storageKey)
+        defer {
+            if let previous {
+                defaults.set(previous, forKey: AppLanguage.storageKey)
+            } else {
+                defaults.removeObject(forKey: AppLanguage.storageKey)
+            }
+        }
+        body()
     }
 
     func testMergesPlatformsByPipelineTimeRatherThanProjectOrder() {

@@ -38,8 +38,10 @@ jobs:
           archive_path="release/StackHub-${VERSION}-macos-arm64.zip"
 
           mkdir -p "$app_path/Contents/MacOS"
+          mkdir -p "$app_path/Contents/Resources"
           cp swift-prototype/.build/release/StackHub "$app_path/Contents/MacOS/StackHub"
           cp swift-prototype/Packaging/Info.plist "$app_path/Contents/Info.plist"
+          cp -R swift-prototype/Sources/Localization/. "$app_path/Contents/Resources"
 
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$app_path/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $GITHUB_RUN_NUMBER" "$app_path/Contents/Info.plist"

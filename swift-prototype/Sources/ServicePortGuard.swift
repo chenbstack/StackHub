@@ -11,15 +11,15 @@ enum ServicePortGuardError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidPort:
-            return "端口必须在 1–65535 之间"
+            return L("端口必须在 1–65535 之间")
         case .inspectionFailed(_, let detail):
-            return "无法检查端口占用（\(detail)）"
+            return LF("无法检查端口占用（%@）", detail)
         case .protectsStackHub:
-            return "该端口正由 StackHub 自身占用，为避免关闭应用未处理"
+            return L("该端口正由 StackHub 自身占用，为避免关闭应用未处理")
         case .terminationFailed(_, let pid, let signal, let code):
-            return "无法向 PID \(pid) 发送信号 \(signal)（错误码 \(code)）"
+            return LF("无法向 PID %ld 发送信号 %ld（错误码 %ld）", Int(pid), Int(signal), Int(code))
         case .stillOccupied(_, let pids):
-            return "PID \(pids.map(String.init).joined(separator: ", ")) 仍在监听"
+            return LF("PID %@ 仍在监听", pids.map(String.init).joined(separator: ", "))
         }
     }
 }
@@ -28,6 +28,13 @@ enum ServicePortGuardError: LocalizedError {
 /// It uses Process arguments rather than a shell command, so the port value is
 /// never interpolated into executable shell text.
 enum ServicePortGuard {
+    /// Development commands often spawn watchers that outlive their immediate
+    /// parent. When a configured port was occupied, sweep it a few more times
+    /// before launching the replacement so a delayed child restart cannot
+    /// reclaim it between the first release and process launch.
+    private static let stabilitySweepCount = 3
+    private static let stabilitySweepDelay: TimeInterval = 0.25
+
     static func configuredPort(from raw: String) -> Int? {
         let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let port = Int(value), (1...65_535).contains(port) else { return nil }
@@ -77,6 +84,32 @@ enum ServicePortGuard {
         return initiallyListening
     }
 
+    /// Release every explicitly configured port together. If the first sweep
+    /// finds a listener, perform two follow-up sweeps to catch child processes
+    /// that briefly restart while their parent command is being terminated.
+    @discardableResult
+    static func release(ports: [Int]) throws -> [Int: [Int32]] {
+        var releasedByPort: [Int: Set<Int32>] = [:]
+        var foundListener = false
+
+        for sweep in 0..<stabilitySweepCount {
+            for port in ports {
+                let released = try release(port: port)
+                guard !released.isEmpty else { continue }
+                releasedByPort[port, default: []].formUnion(released)
+                foundListener = true
+            }
+
+            // An already-empty set of ports needs no startup delay. Once a
+            // listener was found, wait and recheck so detached dev-server
+            // children cannot bind again just after the initial signal.
+            guard foundListener, sweep < stabilitySweepCount - 1 else { break }
+            Thread.sleep(forTimeInterval: stabilitySweepDelay)
+        }
+
+        return releasedByPort.mapValues { $0.sorted() }
+    }
+
     static func listenerProcessIDs(from output: String) -> [Int32] {
         Array(Set(output.split(whereSeparator: { $0.isNewline }).compactMap { Int32(String($0)) })).sorted()
     }
@@ -115,7 +148,7 @@ enum ServicePortGuard {
 
     private static func waitForRelease(of port: Int) throws -> [Int32] {
         var remaining: [Int32] = []
-        for _ in 0..<6 {
+        for _ in 0..<20 {
             remaining = try listenerProcessIDs(on: port)
             if remaining.isEmpty { return [] }
             Thread.sleep(forTimeInterval: 0.05)

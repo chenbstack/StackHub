@@ -42,6 +42,42 @@ final class ServiceDirectoryTests: XCTestCase {
         XCTAssertEqual(ServicePortGuard.listenerProcessIDs(from: "42\n17\n42\ninvalid\n"), [17, 42])
     }
 
+    func testReleaseConfiguredPortsTerminatesEveryListener() throws {
+        let first = try startTemporaryListener()
+        let second = try startTemporaryListener()
+        defer {
+            for process in [first.process, second.process] where process.isRunning {
+                process.terminate()
+                process.waitUntilExit()
+            }
+        }
+
+        let released = try ServicePortGuard.release(ports: [first.port, second.port])
+
+        XCTAssertEqual(released[first.port], [Int32(first.process.processIdentifier)])
+        XCTAssertEqual(released[second.port], [Int32(second.process.processIdentifier)])
+        XCTAssertFalse(first.process.isRunning)
+        XCTAssertFalse(second.process.isRunning)
+    }
+
+    private func startTemporaryListener() throws -> (process: Process, port: Int) {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ruby")
+        process.arguments = [
+            "-rsocket",
+            "-e",
+            "server = TCPServer.new('127.0.0.1', 0); puts server.addr[1]; STDOUT.flush; sleep 30"
+        ]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+
+        let portOutput = output.fileHandleForReading.availableData
+        let port = Int(String(decoding: portOutput, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
+        return (process, try XCTUnwrap(port))
+    }
+
     func testLegacyProjectWithoutServiceDirectoryStillLoads() throws {
         let json = """
         [{"id":"legacy","name":"Existing project","initial":"E","serviceCount":1,

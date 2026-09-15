@@ -124,12 +124,12 @@ struct CIConnectionsSection: View {
                 .background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 9))
             VStack(alignment: .leading, spacing: 3) {
                 Text("GitHub 授权").font(.caption.weight(.semibold))
-                Text(store.isGitHubConnected ? "已连接，仓库和 Actions 可同步" : "尚未连接")
+                Text(L(store.isGitHubConnected ? "已连接，仓库和 Actions 可同步" : "尚未连接"))
                     .font(.caption2).foregroundStyle(.secondary)
             }
             Spacer()
             Circle().fill(store.isGitHubConnected ? .green : .orange).frame(width: 8, height: 8)
-            Button(store.isGitHubConnected ? "管理" : "连接", action: onManageGitHub)
+            Button(L(store.isGitHubConnected ? "管理" : "连接"), action: onManageGitHub)
                 .buttonStyle(StackSecondaryButtonStyle())
                 .controlSize(.small)
         }
@@ -175,6 +175,35 @@ struct CIConnectionsSection: View {
                 .overlay(RoundedRectangle(cornerRadius: 14).stroke(.white.opacity(0.075)))
             }
         }
+    }
+}
+
+struct CIInstanceManagementDetailView: View {
+    let onManageGitHub: () -> Void
+    let onAddGitLab: () -> Void
+    let onEditGitLab: (GitLabInstance) -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ConfigurationDetailHeader(
+                icon: "server.rack",
+                title: "实例管理",
+                subtitle: "管理 GitHub 授权和 GitLab 实例",
+                onClose: onClose
+            )
+            ScrollView {
+                CIConnectionsSection(
+                    onManageGitHub: onManageGitHub,
+                    onAddGitLab: onAddGitLab,
+                    onEditGitLab: onEditGitLab
+                )
+                .padding(16)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(Color(red: 0.055, green: 0.075, blue: 0.12))
+        .closesOnEscape(perform: onClose)
     }
 }
 
@@ -302,8 +331,8 @@ private struct ConfigurationDetailHeader: View {
                 .font(.title3)
                 .foregroundStyle(.teal)
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.subheadline.weight(.semibold))
-                Text(subtitle).font(.caption2).foregroundStyle(.secondary)
+                Text(L(title)).font(.subheadline.weight(.semibold))
+                Text(L(subtitle)).font(.caption2).foregroundStyle(.secondary)
             }
             Spacer()
         }
@@ -334,7 +363,7 @@ private struct ProjectInlineEditor: View {
                 ForEach($draft.services) { $service in
                     VStack(alignment: .leading, spacing: 7) {
                         HStack {
-                            Text(service.name.isEmpty ? "服务" : service.name).font(.caption.weight(.semibold))
+                            Text(service.name.isEmpty ? L("服务") : service.name).font(.caption.weight(.semibold))
                             Spacer()
                             if draft.services.count > 1 {
                                 Button { draft.services.removeAll { $0.id == service.id } } label: { Image(systemName: "trash") }
@@ -386,19 +415,19 @@ private struct DirectoryInputField: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(title).font(.caption2).foregroundStyle(.secondary)
+            Text(L(title)).font(.caption2).foregroundStyle(.secondary)
             HStack(spacing: 8) {
-                TextField(placeholder ?? title, text: $directory)
+                TextField(L(placeholder ?? title), text: $directory)
                     .textFieldStyle(StackInputFieldStyle())
-                    .accessibilityLabel(title)
+                    .accessibilityLabel(L(title))
                 Button(action: chooseDirectory) {
                     Label("选择目录", systemImage: "folder")
                 }
                 .buttonStyle(StackSecondaryButtonStyle())
                 .controlSize(.small)
                 .fixedSize()
-                .help(pickerTitle)
-                .accessibilityLabel(pickerTitle)
+                .help(L(pickerTitle))
+                .accessibilityLabel(L(pickerTitle))
             }
         }
     }
@@ -459,7 +488,7 @@ private struct GitLabInlineEditor: View {
                     .frame(width: 36, height: 36)
                     .background(.orange.opacity(0.14), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(isEditing ? "编辑 GitLab 实例" : "连接 GitLab")
+                    Text(L(isEditing ? "编辑 GitLab 实例" : "连接 GitLab"))
                         .font(.system(size: 16, weight: .semibold, design: .rounded))
                     Text("连接后同步你有权限访问的项目和流水线")
                         .font(.caption2)
@@ -477,9 +506,9 @@ private struct GitLabInlineEditor: View {
                     .fill(hasExistingToken ? .green : .orange)
                     .frame(width: 8, height: 8)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(draft.name.isEmpty ? "新 GitLab 实例" : draft.name)
+                    Text(draft.name.isEmpty ? L("新 GitLab 实例") : draft.name)
                         .font(.caption.weight(.semibold))
-                    Text(hasExistingToken ? "已保存访问令牌" : "尚未连接")
+                    Text(L(hasExistingToken ? "已保存访问令牌" : "尚未连接"))
                         .font(.caption2)
                         .foregroundStyle(hasExistingToken ? .green : .orange)
                 }
@@ -551,13 +580,13 @@ private struct GitLabInlineEditor: View {
 
             HStack {
                 if !canSave {
-                    Text(hasExistingToken ? "填写名称和地址后即可保存" : "填写名称、地址和令牌后即可连接")
+                    Text(L(hasExistingToken ? "填写名称和地址后即可保存" : "填写名称、地址和令牌后即可连接"))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
                 Spacer(minLength: 8)
-                Button(isEditing ? "保存修改" : "连接实例", action: onSave)
+                Button(L(isEditing ? "保存修改" : "连接实例"), action: onSave)
                     .buttonStyle(StackPrimaryButtonStyle())
                     .controlSize(.small)
                     .disabled(!canSave)
@@ -570,11 +599,11 @@ private struct GitLabInlineEditor: View {
 
     private func compactField(_ title: String, placeholder: String, text: Binding<String>) -> some View {
         HStack(spacing: 9) {
-            Text(title)
+            Text(L(title))
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .frame(width: 58, alignment: .leading)
-            TextField(placeholder, text: text)
+            TextField(L(placeholder), text: text)
                 .textFieldStyle(StackInputFieldStyle())
         }
     }
@@ -610,7 +639,7 @@ private struct GitHubInlineEditor: View {
                 Image(systemName: "chevron.left.forwardslash.chevron.right").font(.caption.weight(.bold)).frame(width: 30, height: 30).background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 9))
                 VStack(alignment: .leading, spacing: 2) {
                     Text("GitHub 浏览器授权").font(.caption.weight(.semibold))
-                    Text(isConnected ? "已连接，可读取仓库与 Actions" : "点击后将在浏览器中确认授权").font(.caption2).foregroundStyle(.secondary)
+                    Text(L(isConnected ? "已连接，可读取仓库与 Actions" : "点击后将在浏览器中确认授权")).font(.caption2).foregroundStyle(.secondary)
                 }
                 Spacer()
             }
@@ -708,8 +737,8 @@ private struct OAuthVerificationCodeCard: View {
 private func editorHeader(title: String, subtitle: String) -> some View {
     HStack(alignment: .firstTextBaseline) {
         VStack(alignment: .leading, spacing: 3) {
-            Text(title).font(.subheadline.weight(.semibold))
-            Text(subtitle).font(.caption2).foregroundStyle(.secondary)
+            Text(L(title)).font(.subheadline.weight(.semibold))
+            Text(L(subtitle)).font(.caption2).foregroundStyle(.secondary)
         }
         Spacer()
     }
@@ -717,8 +746,8 @@ private func editorHeader(title: String, subtitle: String) -> some View {
 
 private func labeledField(_ title: String, text: Binding<String>) -> some View {
     VStack(alignment: .leading, spacing: 4) {
-        Text(title).font(.caption2).foregroundStyle(.secondary)
-        TextField(title, text: text).textFieldStyle(StackInputFieldStyle())
+        Text(L(title)).font(.caption2).foregroundStyle(.secondary)
+        TextField(L(title), text: text).textFieldStyle(StackInputFieldStyle())
     }
 }
 
@@ -735,8 +764,8 @@ struct SettingsEmptyRow: View {
                 .frame(width: 29, height: 29)
                 .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
             VStack(alignment: .leading, spacing: 3) {
-                Text(title).font(.caption.weight(.semibold))
-                Text(detail).font(.caption2).foregroundStyle(.secondary)
+                Text(L(title)).font(.caption.weight(.semibold))
+                Text(L(detail)).font(.caption2).foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
         }
@@ -759,8 +788,8 @@ struct SettingsInfoCard: View {
                 .frame(width: 29, height: 29)
                 .background(.teal.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
             VStack(alignment: .leading, spacing: 3) {
-                Text(title).font(.caption.weight(.semibold))
-                Text(detail).font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Text(L(title)).font(.caption.weight(.semibold))
+                Text(L(detail)).font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)
         }

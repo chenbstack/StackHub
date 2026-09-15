@@ -52,9 +52,9 @@ final class GitHubOAuthController: ObservableObject {
     var statusText: String? {
         switch state {
         case .idle: return nil
-        case .starting: return "正在向 GitHub 请求授权码…"
-        case let .waiting(userCode, _): return "请在浏览器输入授权码 \(userCode)，完成后会自动同步。"
-        case .authorized: return "浏览器授权成功，Token 已保存到钥匙串。"
+        case .starting: return L("正在向 GitHub 请求授权码…")
+        case let .waiting(userCode, _): return LF("请在浏览器输入授权码 %@，完成后会自动同步。", userCode)
+        case .authorized: return L("浏览器授权成功，Token 已保存到钥匙串。")
         case let .failed(message): return message
         }
     }
@@ -73,7 +73,7 @@ final class GitHubOAuthController: ObservableObject {
         cancel()
         let trimmedID = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedID.isEmpty else {
-            state = .failed("请先填写 GitHub OAuth Client ID，并在 OAuth App 设置中开启 Device Flow。")
+            state = .failed(L("请先填写 GitHub OAuth Client ID，并在 OAuth App 设置中开启 Device Flow。"))
             return
         }
 
@@ -112,11 +112,11 @@ final class GitHubOAuthController: ObservableObject {
                     }
                 }
                 guard !Task.isCancelled else { return }
-                await MainActor.run { self.state = .failed("GitHub 授权码已过期，请重新开始浏览器授权。") }
+                await MainActor.run { self.state = .failed(L("GitHub 授权码已过期，请重新开始浏览器授权。")) }
             } catch is CancellationError {
                 // A new authorization attempt or cancel() intentionally stops polling.
             } catch {
-                await MainActor.run { self.state = .failed("GitHub 授权失败：\(error.localizedDescription)") }
+                await MainActor.run { self.state = .failed(LF("GitHub 授权失败：%@", error.localizedDescription)) }
             }
         }
     }
@@ -170,13 +170,13 @@ final class GitHubOAuthClient {
         switch payload.error {
         case "authorization_pending": return .pending
         case "slow_down": return .slowDown(payload.interval ?? 5)
-        case "expired_token", "token_expired": return .failed("GitHub 授权码已过期，请重新开始浏览器授权。")
-        case "access_denied": return .failed("你取消了 GitHub 授权。")
-        case "device_flow_disabled": return .failed("该 GitHub OAuth App 未开启 Device Flow。")
+        case "expired_token", "token_expired": return .failed(L("GitHub 授权码已过期，请重新开始浏览器授权。"))
+        case "access_denied": return .failed(L("你取消了 GitHub 授权。"))
+        case "device_flow_disabled": return .failed(L("该 GitHub OAuth App 未开启 Device Flow。"))
         default:
             if let error = payload.errorDescription, !error.isEmpty { return .failed(error) }
-            if !(200..<300).contains(http.statusCode) { return .failed("GitHub 返回 HTTP \(http.statusCode)") }
-            return .failed("GitHub 未返回访问令牌。")
+            if !(200..<300).contains(http.statusCode) { return .failed(LF("GitHub 返回 HTTP %ld", http.statusCode)) }
+            return .failed(L("GitHub 未返回访问令牌。"))
         }
     }
 

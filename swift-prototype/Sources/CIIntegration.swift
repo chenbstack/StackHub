@@ -81,10 +81,10 @@ enum CIIntegrationError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .invalidURL: return "服务地址无效"
-        case let .http(code, message): return "接口请求失败（\(code)）\(message)"
-        case .keychain: return "凭据保存失败"
-        case .missingToken: return "尚未配置访问令牌"
+        case .invalidURL: return L("服务地址无效")
+        case let .http(code, message): return LF("接口请求失败（%ld）%@", code, message)
+        case .keychain: return L("凭据保存失败")
+        case .missingToken: return L("尚未配置访问令牌")
         }
     }
 }
@@ -102,12 +102,12 @@ enum CIExecutionTimeFormatter {
         let remainingSeconds = totalSeconds % 60
 
         if hours > 0 {
-            return minutes > 0 ? "\(hours) 小时 \(minutes) 分钟" : "\(hours) 小时"
+            return minutes > 0 ? LF("%ld 小时 %ld 分钟", hours, minutes) : LF("%ld 小时", hours)
         }
         if minutes > 0 {
-            return remainingSeconds > 0 ? "\(minutes) 分 \(remainingSeconds) 秒" : "\(minutes) 分钟"
+            return remainingSeconds > 0 ? LF("%ld 分 %ld 秒", minutes, remainingSeconds) : LF("%ld 分钟", minutes)
         }
-        return "\(remainingSeconds) 秒"
+        return LF("%ld 秒", remainingSeconds)
     }
 
     static func duration(from start: Date?, to end: Date?) -> String {

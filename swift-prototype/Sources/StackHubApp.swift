@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 final class StackHubAppDelegate: NSObject, NSApplicationDelegate {
     var store: StackHubStore?
@@ -40,10 +41,32 @@ enum PanelTab: String, CaseIterable, Identifiable {
     case projects = "项目"
     case ci = "CI"
     var id: String { rawValue }
+    var title: String { L(rawValue) }
+}
+
+struct LanguageSelector: View {
+    @AppStorage(AppLanguage.storageKey) private var languageRawValue = AppLanguage.system.rawValue
+
+    var body: some View {
+        Menu {
+            Picker(L("语言"), selection: $languageRawValue) {
+                ForEach(AppLanguage.allCases) { language in
+                    Text(language.menuTitle).tag(language.rawValue)
+                }
+            }
+        } label: {
+            Image(systemName: "globe")
+                .frame(width: 28, height: 28)
+        }
+        .buttonStyle(StackIconButtonStyle())
+        .help(L("切换语言"))
+        .accessibilityLabel(L("切换语言"))
+    }
 }
 
 enum PanelDestination: Equatable {
     case projectEditor
+    case ciInstanceManagement
     case githubAuthorization
     case gitLabEditor
 }
@@ -116,11 +139,11 @@ enum ServiceStatus: String, Codable {
     }
     var label: String {
         switch self {
-        case .running: return "运行中"
-        case .starting: return "启动中"
-        case .warning: return "警告"
-        case .stopped: return "已停止"
-        case .failed: return "失败"
+        case .running: return L("运行中")
+        case .starting: return L("启动中")
+        case .warning: return L("警告")
+        case .stopped: return L("已停止")
+        case .failed: return L("失败")
         }
     }
 
@@ -201,10 +224,10 @@ enum ProjectRuntimeState: Equatable {
 
     var label: String {
         switch self {
-        case .ready: return "已就绪"
-        case .partial: return "部分运行"
-        case .stopped: return "已停止"
-        case .issue: return "有问题"
+        case .ready: return L("已就绪")
+        case .partial: return L("部分运行")
+        case .stopped: return L("已停止")
+        case .issue: return L("服务警告")
         }
     }
 
@@ -283,9 +306,9 @@ enum PipelineState: String, Codable {
     }
     var label: String {
         switch self {
-        case .success: return "成功"
-        case .failed: return "失败"
-        case .running: return "运行中"
+        case .success: return L("成功")
+        case .failed: return L("失败")
+        case .running: return L("运行中")
         }
     }
 }
@@ -350,19 +373,19 @@ extension Pipeline {
     /// The compact execution-time copy used by followed-project cards.
     var executionDurationLabel: String {
         guard duration != "—" else {
-            return state == .running ? "执行中" : "耗时未知"
+            return state == .running ? L("执行中") : L("耗时未知")
         }
-        return "执行 " + duration
+        return LF("执行 %@", duration)
     }
 
     /// Prefer the actual start time when a provider exposes it; older cached
     /// runs fall back to their update time so the card still has useful timing.
     var executionTimestampLabel: String {
-        guard let date = startedAt ?? updatedAt else { return "执行时间未知" }
+        guard let date = startedAt ?? updatedAt else { return L("执行时间未知") }
         let formatter = RelativeDateTimeFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.locale = AppLanguage.selected.locale
         formatter.unitsStyle = .short
-        return "执行于 " + formatter.localizedString(for: date, relativeTo: Date())
+        return LF("执行于 %@", formatter.localizedString(for: date, relativeTo: Date()))
     }
 }
 
@@ -390,6 +413,7 @@ final class StackHubStore: ObservableObject {
     private static let githubFullDiscoveryDateKey = "stackhub.ci.github-full-discovery-date"
     private static let githubConnectedMetadataKey = "stackhub.github.connected"
     private static let credentialBundleAccount = "ci.credentials.v1"
+    static let ciRefreshInterval: TimeInterval = 30
 
     @Published var tab: PanelTab = .projects
     @Published var projects: [Project] = []
@@ -840,7 +864,7 @@ final class StackHubStore: ObservableObject {
 
     func refreshCIIfNeeded() {
         guard !isRefreshingCI else { return }
-        let needsRefresh = accessibleCIProjects.isEmpty || lastCIRefresh.map { Date().timeIntervalSince($0) > 300 } ?? true
+        let needsRefresh = accessibleCIProjects.isEmpty || lastCIRefresh.map { Date().timeIntervalSince($0) >= Self.ciRefreshInterval } ?? true
         guard needsRefresh else { return }
         refreshCI()
     }
@@ -1053,7 +1077,7 @@ final class StackHubStore: ObservableObject {
         ciProjects.append(CIMonitoredProject(id: project.id, name: project.name, provider: project.provider, repository: project.repository, branch: project.branch, instanceName: project.instanceName))
         selectedCIProjectID = project.id
         persistCIState()
-        toast = "已关注 \(project.name)"
+        toast = LF("已关注 %@", project.name)
     }
 
     func unfollowProject(_ projectID: String) {
@@ -1061,7 +1085,7 @@ final class StackHubStore: ObservableObject {
         ciProjects.removeAll { $0.id == projectID }
         if selectedCIProjectID == projectID { selectedCIProjectID = ciProjects.first?.id }
         persistCIState()
-        toast = "已取消关注 \(project.name)"
+        toast = LF("已取消关注 %@", project.name)
     }
 
     func toggle(project: Project) {
@@ -1124,7 +1148,7 @@ final class StackHubStore: ObservableObject {
             return
         }
         guard let url = URL(string: raw), ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
-            toast = "访问地址无效：\(raw)"
+            toast = LF("访问地址无效：%@", raw)
             return
         }
         if !NSWorkspace.shared.open(url) { toast = "无法打开访问地址" }
@@ -1174,7 +1198,7 @@ final class StackHubStore: ObservableObject {
         let project = Project(id: UUID().uuidString, name: trimmedName, initial: String(trimmedName.prefix(1)).uppercased(), serviceCount: services.count, issue: false, isExpanded: true, services: services, directory: (trimmedDirectory as NSString).expandingTildeInPath)
         projects.append(project)
         persistCIState()
-        toast = "已添加项目 \(trimmedName)"
+        toast = LF("已添加项目 %@", trimmedName)
         return true
     }
 
@@ -1225,25 +1249,26 @@ final class StackHubStore: ObservableObject {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory), isDirectory.boolValue else {
             updateService(service.id, in: project.id, status: .failed)
-            toast = "\(service.name) 的启动目录不存在或不是文件夹：\(directory.path)"
+            toast = LF("%@ 的启动目录不存在或不是文件夹：%@", service.name, directory.path)
             return
         }
         updateService(service.id, in: project.id, status: .starting)
         serviceLogs[service.id] = ""
-        for port in service.ports {
-            do {
-                let releasedPIDs = try ServicePortGuard.release(port: port)
+        do {
+            let releasedByPort = try ServicePortGuard.release(ports: service.ports)
+            for port in service.ports {
+                let releasedPIDs = releasedByPort[port] ?? []
                 if !releasedPIDs.isEmpty {
                     serviceLogs[service.id, default: ""].append("[StackHub] 端口 \(port) 被 PID \(releasedPIDs.map(String.init).joined(separator: ", ")) 占用，已释放。\n")
                 }
-            } catch {
-                updateService(service.id, in: project.id, status: .failed)
-                let message = "端口 \(port) 无法释放：\(error.localizedDescription)"
-                serviceLogs[service.id] = "[StackHub] \(message)\n"
-                toast = "\(service.name) \(message)"
-                persistCIState()
-                return
             }
+        } catch {
+            updateService(service.id, in: project.id, status: .failed)
+            let message = "配置端口无法释放：\(error.localizedDescription)"
+            serviceLogs[service.id] = "[StackHub] \(message)\n"
+            toast = LF("%@ %@", service.name, message)
+            persistCIState()
+            return
         }
         let process = Process()
         let pipe = Pipe()
@@ -1295,7 +1320,7 @@ final class StackHubStore: ObservableObject {
             runningProcesses[service.id] = process
         } catch {
             updateService(service.id, in: project.id, status: .failed)
-            toast = "启动失败：\(error.localizedDescription)"
+            toast = LF("启动失败：%@", error.localizedDescription)
         }
     }
 
@@ -1461,6 +1486,11 @@ struct StackHubPanel: View {
     @StateObject private var githubOAuth = GitHubOAuthController()
     @State private var selectedDestination: PanelDestination?
     @AppStorage("stackhub.panel.height") private var panelHeight = 640.0
+    @AppStorage(AppLanguage.storageKey) private var languageRawValue = AppLanguage.system.rawValue
+
+    private var selectedLanguage: AppLanguage {
+        AppLanguage(rawValue: languageRawValue) ?? .system
+    }
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -1489,7 +1519,7 @@ struct StackHubPanel: View {
             PanelWindowTuner().frame(width: 0, height: 0)
 
             if let toast = store.toast {
-                Text(toast)
+                Text(L(toast))
                     .font(.caption)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
@@ -1500,6 +1530,7 @@ struct StackHubPanel: View {
             }
         }
         .environment(\.colorScheme, .dark)
+        .environment(\.locale, selectedLanguage.locale)
         .preferredColorScheme(.dark)
         .foregroundStyle(.white)
         .animation(.easeOut(duration: 0.18), value: store.toast)
@@ -1526,15 +1557,10 @@ struct StackHubPanel: View {
                         switch store.tab {
                         case .projects:
                             ProjectsView(
-                                onAddProject: openNewProjectEditor,
                                 onEditProject: openProjectEditor
                             )
                         case .ci:
-                            CIView(
-                                onManageGitHub: openGitHubAuthorization,
-                                onAddGitLab: openNewGitLabEditor,
-                                onEditGitLab: openGitLabEditor
-                            )
+                            CIView()
                         }
                     }
                     .padding(.horizontal, 16)
@@ -1543,20 +1569,26 @@ struct StackHubPanel: View {
                 .frame(maxHeight: .infinity)
             }
             HStack {
-                Text("StackHub · 菜单栏")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Spacer()
                 Button {
                     NSApplication.shared.terminate(nil)
                 } label: {
-                    Label("退出", systemImage: "power")
+                    Image(systemName: "power")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
                 }
-                .buttonStyle(StackSecondaryButtonStyle())
-                .controlSize(.small)
-                .help("退出 StackHub")
-                .accessibilityLabel("退出 StackHub")
+                .buttonStyle(.plain)
+                .help(L("退出 StackHub"))
+                .accessibilityLabel(L("退出 StackHub"))
                 .keyboardShortcut("q", modifiers: .command)
+                Spacer()
+                switch store.tab {
+                case .projects:
+                    FooterActionButton(title: "添加项目", systemName: "plus") { openNewProjectEditor() }
+                case .ci:
+                    FooterActionButton(title: "实例管理", systemName: "server.rack") { openCIInstanceManagement() }
+                }
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 11)
@@ -1567,13 +1599,14 @@ struct StackHubPanel: View {
     private var contentHeader: some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(store.tab == .projects ? "项目" : "CI 活动")
+                Text(L(store.tab == .projects ? "项目" : "CI 活动"))
                     .font(.system(size: 24, weight: .semibold, design: .rounded))
-                Text(store.tab == .projects ? "本地开发堆栈" : "查看各平台的构建与发布")
+                Text(L(store.tab == .projects ? "本地开发堆栈" : "查看各平台的构建与发布"))
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.46))
             }
             Spacer()
+            LanguageSelector()
             HStack(spacing: 7) {
                 Circle().fill(.green).frame(width: 8, height: 8)
                 Text("健康").font(.caption.weight(.medium)).foregroundStyle(.green.opacity(0.9))
@@ -1594,6 +1627,13 @@ struct StackHubPanel: View {
             if let draft = settingsState.projectDraft {
                 ProjectEditorDetailView(draft: draft, onClose: closeDestination)
             }
+        case .ciInstanceManagement:
+            CIInstanceManagementDetailView(
+                onManageGitHub: openGitHubAuthorization,
+                onAddGitLab: openNewGitLabEditor,
+                onEditGitLab: openGitLabEditor,
+                onClose: closeDestination
+            )
         case .githubAuthorization:
             GitHubAuthorizationDetailView(oauth: githubOAuth, onClose: closeDestination)
         case .gitLabEditor:
@@ -1611,6 +1651,10 @@ struct StackHubPanel: View {
     private func openProjectEditor(_ project: Project) {
         settingsState.beginEditProject(project)
         withAnimation(.easeOut(duration: 0.18)) { selectedDestination = .projectEditor }
+    }
+
+    private func openCIInstanceManagement() {
+        withAnimation(.easeOut(duration: 0.18)) { selectedDestination = .ciInstanceManagement }
     }
 
     private func openGitHubAuthorization() {
@@ -1671,7 +1715,7 @@ struct MenuOverviewView: View {
                 }
             }
 
-            SectionLabel(title: "堆栈概览", trailing: "\(store.projects.count) 个本地项目")
+            SectionLabel(title: "堆栈概览", trailing: LF("%ld 个本地项目", store.projects.count))
             OverviewFeatureCard(projectCount: store.projects.count, runningServices: runningServices, totalServices: allServices.count)
 
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 9), GridItem(.flexible(), spacing: 9)], spacing: 9) {
@@ -1681,7 +1725,7 @@ struct MenuOverviewView: View {
                 MetricCard(icon: "server.rack", title: "服务", value: "\(runningServices) / \(allServices.count)", detail: allServices.isEmpty ? "尚未配置服务" : "正在运行", tint: .green) {
                     store.tab = .projects
                 }
-                MetricCard(icon: "bolt.horizontal.fill", title: "CI 流水线", value: "\(pipelines.count)", detail: failedPipelines == 0 ? "暂无失败" : "\(failedPipelines) 个失败", tint: .orange) {
+                MetricCard(icon: "bolt.horizontal.fill", title: "CI 流水线", value: "\(pipelines.count)", detail: failedPipelines == 0 ? "暂无失败" : LF("%ld 个失败", failedPipelines), tint: .orange) {
                     store.tab = .ci
                 }
                 MetricCard(icon: "shippingbox.fill", title: "GitLab 实例", value: "\(store.instances.count)", detail: "已连接", tint: .teal) {
@@ -1705,17 +1749,17 @@ struct RecommendationCard: View {
             Image(systemName: icon)
                 .font(.system(size: 20, weight: .medium))
                 .foregroundStyle(accent)
-            Text(title)
+                    Text(L(title))
                 .font(.system(size: 13, weight: .semibold))
                 .lineLimit(2)
                 .padding(.top, 11)
-            Text(detail)
+                    Text(L(detail))
                 .font(.caption2)
                 .foregroundStyle(.white.opacity(0.44))
                 .lineLimit(2)
                 .padding(.top, 5)
             Spacer(minLength: 13)
-            Button(actionTitle, action: action)
+            Button(L(actionTitle), action: action)
                 .buttonStyle(RecommendationButtonStyle(accent: accent))
         }
         .padding(13)
@@ -1747,9 +1791,9 @@ struct OverviewFeatureCard: View {
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(totalServices == 0 || runningServices == totalServices ? .green : .orange)
             }
-            Text(totalServices == 0 ? "还没有配置本地项目" : "\(runningServices) / \(totalServices) 个服务运行中")
+            Text(totalServices == 0 ? L("还没有配置本地项目") : LF("%ld / %ld 个服务运行中", runningServices, totalServices))
                 .font(.system(size: 14, weight: .semibold))
-            Text(projectCount == 0 ? "从项目页添加工作目录和服务后，这里会显示实时状态。" : "状态来自本机进程监控；服务启动、停止和健康检查将在此处汇总。")
+            Text(L(projectCount == 0 ? "从项目页添加工作目录和服务后，这里会显示实时状态。" : "状态来自本机进程监控；服务启动、停止和健康检查将在此处汇总。"))
                 .font(.caption2)
                 .foregroundStyle(.white.opacity(0.48))
                 .lineSpacing(3)
@@ -1777,8 +1821,8 @@ struct MetricCard: View {
                     Spacer()
                     Text(value).font(.system(size: 14, weight: .semibold, design: .rounded))
                 }
-                Text(title).font(.system(size: 12, weight: .semibold))
-                Text(detail).font(.caption2).foregroundStyle(.white.opacity(0.44))
+                Text(L(title)).font(.system(size: 12, weight: .semibold))
+                Text(L(detail)).font(.caption2).foregroundStyle(.white.opacity(0.44))
             }
             .padding(12)
             .frame(maxWidth: .infinity, minHeight: 92, alignment: .leading)
@@ -1802,13 +1846,20 @@ struct CompactProjectRow: View {
                     .background(state == .issue ? .orange.opacity(0.82) : .indigo.opacity(0.9), in: RoundedRectangle(cornerRadius: 8))
                 VStack(alignment: .leading, spacing: 3) {
                     Text(project.name).font(.subheadline.weight(.medium))
-                    Text("\(project.serviceCount) 个服务").font(.caption2).foregroundStyle(.white.opacity(0.46))
+                    Text(LF("%ld 个服务", project.serviceCount)).font(.caption2).foregroundStyle(.white.opacity(0.46))
                 }
                 Spacer()
                 HStack(spacing: 5) {
                     ForEach(0..<project.serviceCount, id: \.self) { _ in Circle().fill(state.color).frame(width: 6, height: 6) }
                 }
-                Text(state.label).font(.caption2.weight(.medium)).foregroundStyle(state.color)
+                if state == .issue {
+                    Circle()
+                        .fill(.yellow)
+                        .frame(width: 7, height: 7)
+                        .accessibilityLabel("服务警告")
+                } else {
+                    Text(state.label).font(.caption2.weight(.medium)).foregroundStyle(state.color)
+                }
                 Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.white.opacity(0.3))
             }
             .padding(.horizontal, 12)
@@ -1829,7 +1880,7 @@ struct CompactCIBadge: View {
         HStack(spacing: 8) {
             Text(provider).font(.system(size: 10, weight: .bold)).frame(width: 24, height: 24).background(.white.opacity(0.09), in: RoundedRectangle(cornerRadius: 7))
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.caption.weight(.medium))
+                Text(L(title)).font(.caption.weight(.medium))
                 Text(state.label).font(.caption2).foregroundStyle(state.color)
             }
             Spacer()
@@ -1844,21 +1895,12 @@ struct CompactCIBadge: View {
 
 struct ProjectsView: View {
     @EnvironmentObject private var store: StackHubStore
-    let onAddProject: () -> Void
     let onEditProject: (Project) -> Void
     @State private var deletingProject: Project?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline) {
-                SectionLabel(title: "项目", trailing: "\(store.projects.count) 个项目 · \(store.projects.flatMap(\.services).count) 个服务")
-                Spacer()
-                Button(action: onAddProject) {
-                    Label("添加项目", systemImage: "plus")
-                }
-                .buttonStyle(StackSecondaryButtonStyle())
-                .controlSize(.small)
-            }
+            SectionLabel(title: "项目", trailing: LF("%ld 个项目 · %ld 个服务", store.projects.count, store.projects.flatMap(\.services).count))
             if store.projects.isEmpty {
                 EmptyStateCard(icon: "folder.badge.plus", title: "还没有本地项目", detail: "点击“添加项目”，配置工作目录和服务。")
             } else {
@@ -1906,13 +1948,33 @@ struct ProjectCard: View {
                         .frame(width: 34, height: 34)
                         .background(state == .issue ? Color.orange.opacity(0.8) : Color.indigo.opacity(0.85), in: RoundedRectangle(cornerRadius: 10))
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(project.name).font(.subheadline.weight(.semibold))
-                        Text("\(verifiedServiceCount) / \(project.serviceCount) 个服务已就绪").font(.caption2).foregroundStyle(.secondary)
+                        Text(project.name)
+                            .font(.subheadline.weight(.semibold))
+                            .lineLimit(1)
+                        Text(LF("%ld / %ld 个服务已就绪", verifiedServiceCount, project.serviceCount))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                     }
+                    .frame(minWidth: 0, alignment: .leading)
                     Spacer(minLength: 8)
-                    Label(state.label, systemImage: "circle.fill")
-                        .font(.caption2).foregroundStyle(state.color)
-                        .labelStyle(.titleAndIcon)
+                    if state == .issue {
+                        Circle()
+                            .fill(.yellow)
+                            .frame(width: 9, height: 9)
+                            .frame(width: 76, alignment: .trailing)
+                            .accessibilityLabel("服务警告")
+                            .help("服务出现警告，查看日志了解详情")
+                    } else {
+                        Label(state.label, systemImage: "circle.fill")
+                            .font(.caption2)
+                            .foregroundStyle(state.color)
+                            .labelStyle(.titleAndIcon)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                            .frame(width: 76, alignment: .trailing)
+                    }
                     Image(systemName: "chevron.down")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -1922,30 +1984,13 @@ struct ProjectCard: View {
                 }
                 .buttonStyle(.plain)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                Button(action: onEdit) {
-                    Image(systemName: "pencil")
-                        .frame(width: 28, height: 28)
-                }
-                .buttonStyle(StackIconButtonStyle())
-                .help("编辑项目")
-                .accessibilityLabel("编辑 \(project.name)")
-                Button(action: onDelete) {
-                    Image(systemName: "trash")
-                        .frame(width: 28, height: 28)
-                }
-                .buttonStyle(StackIconButtonStyle())
-                .help("移除项目")
-                .accessibilityLabel("移除 \(project.name)")
-                if projectIsRunning {
-                    Button("停止") {
-                        store.projectAction(project, action: "停止")
-                    }
-                    .buttonStyle(ProjectActionButtonStyle(tint: .red))
-                } else {
-                    Button("启动") {
-                        store.projectAction(project, action: "启动")
-                    }
-                    .buttonStyle(StackSecondaryButtonStyle())
+                HoverIconButton(systemName: "pencil", help: "编辑项目", action: onEdit)
+                HoverIconButton(systemName: "trash", help: "移除项目", action: onDelete)
+                HoverIconButton(
+                    systemName: projectIsRunning ? "stop.fill" : "play.fill",
+                    help: projectIsRunning ? "停止" : "启动"
+                ) {
+                    store.projectAction(project, action: projectIsRunning ? "停止" : "启动")
                 }
             }
             .padding(12)
@@ -1971,34 +2016,25 @@ struct ServiceRow: View {
             HStack(spacing: 9) {
                 Circle().fill(service.status.color).frame(width: 9, height: 9)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(service.name).font(.subheadline)
-                    Text(service.status.label)
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(service.status.color)
-                    Text(service.command).font(.caption2).foregroundStyle(.secondary)
-                    Text(service.directory.map { $0.isEmpty ? "目录：项目工作目录" : "目录：\($0)" } ?? "目录：项目工作目录")
-                        .font(.caption2).foregroundStyle(.secondary)
-                    if !service.ports.isEmpty {
-                        Text("端口：\(service.ports.map(String.init).joined(separator: ", "))（启动前自动释放占用）")
-                            .font(.caption2).foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        Text(service.name).font(.subheadline)
+                        Text(service.status.label)
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(service.status.color)
                     }
-                    Text(service.url).font(.caption2).foregroundStyle(.secondary)
+                    Text(service.command)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
                 Spacer()
                 HStack(spacing: 5) {
-                    Button {
+                    HoverIconButton(systemName: "doc.text", help: "打开日志") {
                         withAnimation(.easeOut(duration: 0.18)) { store.openServiceLog(service) }
-                    } label: {
-                        Image(systemName: "doc.text")
-                            .frame(width: 28, height: 28)
                     }
-                    .buttonStyle(StackIconButtonStyle())
-                    .help("打开日志")
-                    .accessibilityLabel("打开日志")
-                    SmallIconButton(systemName: "arrow.up.right") { store.openService(service) }
-                    SmallIconButton(systemName: "arrow.clockwise") { store.restartService(service) }
-                        .help("重启服务")
-                    SmallIconButton(systemName: service.status.hasManagedProcess ? "stop.fill" : "play.fill") { store.serviceAction(service) }
+                    HoverIconButton(systemName: "arrow.up.right", help: "打开服务") { store.openService(service) }
+                    HoverIconButton(systemName: "arrow.clockwise", help: "重启服务") { store.restartService(service) }
+                    HoverIconButton(systemName: service.status.hasManagedProcess ? "stop.fill" : "play.fill", help: service.status.hasManagedProcess ? "停止服务" : "启动服务") { store.serviceAction(service) }
                 }
             }
             .padding(.vertical, 8)
@@ -2050,7 +2086,7 @@ struct ServiceLogDetailView: View {
                     .foregroundStyle(.teal)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("运行日志").font(.subheadline.weight(.semibold))
-                    Text("\(service.name) · \(lineCount == 0 ? "暂无输出" : "\(lineCount) 行")")
+                    Text(LF("%@ · %@", service.name, lineCount == 0 ? L("暂无输出") : LF("%ld 行", lineCount)))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -2109,19 +2145,11 @@ struct ServiceLogDetailView: View {
 
 struct CIView: View {
     @EnvironmentObject private var store: StackHubStore
-    let onManageGitHub: () -> Void
-    let onAddGitLab: () -> Void
-    let onEditGitLab: (GitLabInstance) -> Void
     @State private var expandedProjectID: String?
-    @State private var isAddingFollow = false
+    private let refreshTimer = Timer.publish(every: StackHubStore.ciRefreshInterval, on: .main, in: .common).autoconnect()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            CIConnectionsSection(
-                onManageGitHub: onManageGitHub,
-                onAddGitLab: onAddGitLab,
-                onEditGitLab: onEditGitLab
-            )
             SectionLabel(title: "关注项目", trailing: "与本地项目独立")
             if store.visibleFollowedCIProjects.isEmpty {
                 EmptyStateCard(icon: "eye.slash", title: "还没有关注项目", detail: "在下方流水线列表中点击“关注项目”即可添加。")
@@ -2144,49 +2172,14 @@ struct CIView: View {
                     }
                 }
             }
-            Text("CI 关注项目仅用于查看远端流水线，不会出现在本地项目页。")
-                .font(.caption2)
-                .foregroundStyle(.blue.opacity(0.85))
-                .padding(.horizontal, 2)
-            Button {
-                withAnimation(.easeOut(duration: 0.16)) { isAddingFollow.toggle() }
-            } label: {
-                Label(isAddingFollow ? "收起项目选择" : "添加关注项目", systemImage: isAddingFollow ? "chevron.up" : "plus")
-                    .font(.caption.weight(.medium))
-                    .frame(maxWidth: .infinity)
+            HStack(alignment: .firstTextBaseline) {
+                Text(L("全部流水线"))
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                CIRefreshStatusButton()
             }
-            .buttonStyle(StackSecondaryButtonStyle())
-            if isAddingFollow {
-                VStack(alignment: .leading, spacing: 0) {
-                    let candidates = store.accessibleCIProjects.filter { !store.isFollowing($0.id) }
-                    if candidates.isEmpty {
-                        Text("没有可添加的项目；下方列表中的项目都已关注。")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .padding(12)
-                    } else {
-                        ForEach(candidates) { project in
-                            HStack(spacing: 9) {
-                                Circle().fill(.teal).frame(width: 7, height: 7)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(project.name).font(.caption.weight(.medium))
-                                    Text("\(project.provider) · \(project.repository)").font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                                }
-                                Spacer()
-                                Button("关注") { store.followProject(project.id) }
-                                    .buttonStyle(StackSecondaryButtonStyle())
-                                    .controlSize(.small)
-                            }
-                            .padding(10)
-                            if project.id != candidates.last?.id { Divider().padding(.leading, 16) }
-                        }
-                    }
-                }
-                .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14))
-                .overlay(RoundedRectangle(cornerRadius: 14).stroke(.white.opacity(0.075)))
-            }
-
-            SectionLabel(title: "全部流水线", trailing: "已同步 \(store.accessibleCIProjects.count) 个项目")
+            .padding(.horizontal, 2)
+            .padding(.top, 5)
             Text("来自已连接账号触发的最近活动；关注项目后会在上方持续跟踪最近 5 条。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -2214,6 +2207,38 @@ struct CIView: View {
             }
         }
         .onAppear { store.refreshCIIfNeeded() }
+        .onReceive(refreshTimer) { _ in store.refreshCIIfNeeded() }
+    }
+}
+
+private struct CIRefreshStatusButton: View {
+    @EnvironmentObject private var store: StackHubStore
+
+    var body: some View {
+        Button { store.refreshCI() } label: {
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                HStack(spacing: 5) {
+                    Image(systemName: store.isRefreshingCI ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
+                    Text(updateAge(at: context.date))
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .frame(minHeight: 20)
+                .contentShape(Rectangle())
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(store.isRefreshingCI)
+        .help(L(store.isRefreshingCI ? "正在刷新 CI" : "点击立即刷新 CI"))
+        .accessibilityLabel(L("立即刷新 CI"))
+    }
+
+    private func updateAge(at date: Date) -> String {
+        if store.isRefreshingCI { return L("刷新中") }
+        guard let lastRefresh = store.lastCIRefresh else { return L("尚未更新") }
+        let elapsedSeconds = max(0, Int(date.timeIntervalSince(lastRefresh)))
+        if elapsedSeconds < 60 { return LF("%ld 秒前", elapsedSeconds) }
+        return LF("%ld 分钟前", elapsedSeconds / 60)
     }
 }
 
@@ -2230,8 +2255,8 @@ struct EmptyStateCard: View {
                 .frame(width: 34, height: 34)
                 .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
             VStack(alignment: .leading, spacing: 3) {
-                Text(title).font(.subheadline.weight(.semibold))
-                Text(detail).font(.caption2).foregroundStyle(.secondary)
+                Text(L(title)).font(.subheadline.weight(.semibold))
+                Text(L(detail)).font(.caption2).foregroundStyle(.secondary)
             }
             Spacer()
         }
@@ -2267,9 +2292,9 @@ struct CIActivityRow: View {
 
     private var providerCode: String { project.provider.hasPrefix("GitHub") ? "GH" : "GL" }
     private var timeLabel: String {
-        guard let date = pipeline.updatedAt else { return "时间未知" }
+        guard let date = pipeline.updatedAt else { return L("时间未知") }
         let formatter = RelativeDateTimeFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.locale = AppLanguage.selected.locale
         formatter.unitsStyle = .short
         return formatter.localizedString(for: date, relativeTo: Date())
     }
@@ -2300,7 +2325,7 @@ struct CIActivityRow: View {
             }
 
             HStack(spacing: 8) {
-                Text(pipeline.id.hasPrefix("github") ? "构建与测试" : "发布流水线")
+                Text(L(pipeline.id.hasPrefix("github") ? "构建与测试" : "发布流水线"))
                     .font(.subheadline.weight(.medium))
                 CIStageProgress(stages: pipeline.stages, isLoaded: pipeline.hasLoadedStages, onStageTap: onStageTap)
                 Spacer(minLength: 4)
@@ -2312,7 +2337,7 @@ struct CIActivityRow: View {
             HStack(spacing: 8) {
                 Button(action: onFollow) {
                     Image(systemName: isFollowing ? "star.fill" : "star")
-                        .frame(width: 32, height: 32)
+                        .frame(width: 24, height: 24)
                 }
                 .buttonStyle(CIFollowButtonStyle(isFollowing: isFollowing))
                 .accessibilityLabel(isFollowing ? "取消关注项目" : "关注项目")
@@ -2335,10 +2360,9 @@ struct CIFollowButtonStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.system(size: 14, weight: .semibold))
-            .foregroundStyle(isFollowing ? .green : .white)
-            .background((isFollowing ? Color.green.opacity(0.12) : Color.purple.opacity(0.78)), in: Circle())
-            .overlay(Circle().stroke(isFollowing ? Color.green.opacity(0.26) : Color.white.opacity(0.08)))
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(isFollowing ? .yellow : .white.opacity(0.6))
+            .contentShape(Rectangle())
             .scaleEffect(configuration.isPressed ? 0.92 : 1)
             .opacity(configuration.isPressed ? 0.78 : 1)
             .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
@@ -2410,7 +2434,7 @@ struct CIProjectCard: View {
                         Text(latest.executionTimestampLabel)
                             .font(.caption2)
                             .foregroundStyle(.secondary)
-                        Text(isExpanded ? "最近 5 条流水线" : "点击查看历史")
+                        Text(L(isExpanded ? "最近 5 条流水线" : "点击查看历史"))
                             .font(.caption2)
                             .foregroundStyle(.secondary.opacity(0.82))
                     }
@@ -2443,9 +2467,9 @@ struct CIProjectCard: View {
     }
 
     private func runTimeLabel(_ index: Int) -> String {
-        guard runs.indices.contains(index), let date = runs[index].updatedAt else { return "时间未知" }
+        guard runs.indices.contains(index), let date = runs[index].updatedAt else { return L("时间未知") }
         let formatter = RelativeDateTimeFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.locale = AppLanguage.selected.locale
         formatter.unitsStyle = .short
         return formatter.localizedString(for: date, relativeTo: Date())
     }
@@ -2536,7 +2560,7 @@ struct CIRunRow: View {
             HStack(spacing: 8) {
                 Circle().fill(pipeline.state.color).frame(width: 8, height: 8)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(pipeline.id.hasPrefix("github") ? "构建与测试" : "发布流水线")
+                    Text(L(pipeline.id.hasPrefix("github") ? "构建与测试" : "发布流水线"))
                         .font(.caption.weight(.medium))
                     Text("\(pipeline.commit) · \(timeLabel)")
                         .font(.caption2)
@@ -2576,11 +2600,11 @@ struct PipelineCard: View {
     private var repositorySummary: String {
         let repository = monitoredProject?.repository ?? pipeline.repository
         let branch = monitoredProject?.branch ?? pipeline.branch
-        return "\(repository) / \(branch) · 17 分钟前"
+        return LF("%@ / %@ · 17 分钟前", repository, branch)
     }
 
     private var pipelineTitle: String {
-        pipeline.id.hasPrefix("github") ? "构建与测试" : "发布流水线"
+        L(pipeline.id.hasPrefix("github") ? "构建与测试" : "发布流水线")
     }
 
     private var providerBadge: some View {
@@ -2616,7 +2640,7 @@ struct PipelineCard: View {
             Spacer()
             VStack(alignment: .trailing, spacing: 5) {
                 Text(pipeline.duration).font(.caption2).foregroundStyle(.secondary)
-                Button(pipeline.provider == "GitHub Actions" ? "查看运行" : "查看流水线") {
+                Button(L(pipeline.provider == "GitHub Actions" ? "查看运行" : "查看流水线")) {
                     store.openPipeline(pipeline)
                 }
                 .buttonStyle(StackSecondaryButtonStyle())
@@ -2697,10 +2721,10 @@ struct PipelineDetailView: View {
     }
 
     private var displayedLog: String {
-        guard pipeline.hasLoadedStages else { return "正在加载作业日志…" }
-        guard let selectedStage else { return "暂无作业日志" }
+        guard pipeline.hasLoadedStages else { return L("正在加载作业日志…") }
+        guard let selectedStage else { return L("暂无作业日志") }
         guard !selectedStage.log.isEmpty else {
-            return store.isLoadingStage(selectedStage.id) ? "正在加载该步骤日志…" : "该阶段暂无日志"
+            return store.isLoadingStage(selectedStage.id) ? L("正在加载该步骤日志…") : L("该阶段暂无日志")
         }
         return "[\(selectedStage.name)]\n\(selectedStage.log)"
     }
@@ -2712,7 +2736,7 @@ struct PipelineDetailView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 15) {
-            HStack { VStack(alignment: .leading, spacing: 4) { Text("\(pipeline.provider == "GitHub Actions" ? "构建与测试" : "发布流水线")").font(.headline); Text("\(pipeline.repository) / \(pipeline.branch)").font(.caption).foregroundStyle(.secondary) }; Spacer(); Button("返回", action: onClose).buttonStyle(StackSecondaryButtonStyle()) }
+            HStack { VStack(alignment: .leading, spacing: 4) { Text(L(pipeline.provider == "GitHub Actions" ? "构建与测试" : "发布流水线")).font(.headline); Text("\(pipeline.repository) / \(pipeline.branch)").font(.caption).foregroundStyle(.secondary) }; Spacer(); Button("返回", action: onClose).buttonStyle(StackSecondaryButtonStyle()) }
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                     ForEach(pipeline.stages) { stage in
@@ -2737,7 +2761,7 @@ struct PipelineDetailView: View {
                     Text("作业日志").font(.subheadline.weight(.semibold))
                     Text("· \(selectedStage.name)").font(.caption2).foregroundStyle(.secondary)
                     Spacer()
-                    Text(logLineCount == 0 ? (pipeline.hasLoadedStages ? "暂无日志" : "正在加载") : "\(logLineCount) 行")
+                    Text(logLineCount == 0 ? L(pipeline.hasLoadedStages ? "暂无日志" : "正在加载") : LF("%ld 行", logLineCount))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -2756,7 +2780,7 @@ struct PipelineDetailView: View {
                         .buttonStyle(StackSecondaryButtonStyle())
                         .disabled(logLineCount == 0)
                     Spacer()
-                    Button("在 \(pipeline.provider == "GitHub Actions" ? "GitHub" : "GitLab") 中打开") { openExternal() }
+                    Button(LF("在 %@ 中打开", pipeline.provider == "GitHub Actions" ? "GitHub" : "GitLab")) { openExternal() }
                         .buttonStyle(StackPrimaryButtonStyle())
                         .disabled(pipeline.webURL == nil)
                 }
@@ -2776,7 +2800,7 @@ struct PipelineDetailView: View {
                 .background(Color.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 12))
                 HStack {
                     Spacer()
-                    Button("在 \(pipeline.provider == "GitHub Actions" ? "GitHub" : "GitLab") 中打开") { openExternal() }
+                    Button(LF("在 %@ 中打开", pipeline.provider == "GitHub Actions" ? "GitHub" : "GitLab")) { openExternal() }
                         .buttonStyle(StackPrimaryButtonStyle())
                         .disabled(pipeline.webURL == nil)
                 }
@@ -2834,7 +2858,7 @@ struct TabStrip: View {
         HStack(spacing: 3) {
             ForEach(PanelTab.allCases) { tab in
                 Button { selection = tab } label: {
-                    Text(tab.rawValue)
+                    Text(tab.title)
                         .font(.system(size: 12, weight: .medium))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 8)
@@ -2866,7 +2890,7 @@ struct SidebarItem: View {
                 Image(systemName: systemImage)
                     .font(.system(size: 12, weight: .semibold))
                     .frame(width: 18)
-                Text(title).font(.system(size: 12, weight: selected ? .semibold : .medium))
+                Text(L(title)).font(.system(size: 12, weight: selected ? .semibold : .medium))
                 Spacer()
                 if let badge {
                     Text(badge)
@@ -2948,32 +2972,67 @@ struct RecommendationButtonStyle: ButtonStyle {
     }
 }
 
-struct ProjectActionButtonStyle: ButtonStyle {
-    let tint: Color
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 10, weight: .semibold))
-            .foregroundStyle(tint.opacity(configuration.isPressed ? 0.65 : 0.95))
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(tint.opacity(configuration.isPressed ? 0.17 : 0.09), in: Capsule())
-            .overlay(Capsule().stroke(tint.opacity(0.2)))
-            .scaleEffect(configuration.isPressed ? 0.96 : 1)
-            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
-    }
-}
-
 struct SectionLabel: View {
     let title: String
     var trailing: String?
-    var body: some View { HStack { Text(title).font(.subheadline.weight(.semibold)); Spacer(); if let trailing { Text(trailing).font(.caption2).foregroundStyle(.secondary) } }.padding(.horizontal, 2).padding(.top, 5) }
+    var body: some View { HStack { Text(L(title)).font(.subheadline.weight(.semibold)); Spacer(); if let trailing { Text(L(trailing)).font(.caption2).foregroundStyle(.secondary) } }.padding(.horizontal, 2).padding(.top, 5) }
 }
 
 struct SmallIconButton: View {
     let systemName: String
     let action: () -> Void
     var body: some View { Button(action: action) { Image(systemName: systemName).frame(width: 28, height: 28) }.buttonStyle(StackIconButtonStyle()) }
+}
+
+private struct HoverIconButton: View {
+    let systemName: String
+    let help: String
+    let action: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 12, weight: .medium))
+                .frame(width: 28, height: 28)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.white.opacity(isHovering ? 0.92 : 0.7))
+        .background(isHovering ? Color.white.opacity(0.075) : .clear, in: RoundedRectangle(cornerRadius: 7))
+        .overlay(RoundedRectangle(cornerRadius: 7).stroke(isHovering ? .white.opacity(0.085) : .clear))
+        .onHover { isHovering = $0 }
+        .help(L(help))
+        .accessibilityLabel(L(help))
+    }
+}
+
+private struct FooterActionButton: View {
+    let title: String
+    let systemName: String
+    let action: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: systemName)
+                    .font(.system(size: 12, weight: .medium))
+                Text(L(title))
+            }
+            .font(.caption.weight(.medium))
+            .padding(.horizontal, 8)
+            .frame(minHeight: 28)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.white.opacity(isHovering ? 0.92 : 0.7))
+        .background(isHovering ? Color.white.opacity(0.075) : .clear, in: RoundedRectangle(cornerRadius: 7))
+        .overlay(RoundedRectangle(cornerRadius: 7).stroke(isHovering ? .white.opacity(0.085) : .clear))
+        .onHover { isHovering = $0 }
+        .help(L(title))
+        .accessibilityLabel(L(title))
+    }
 }
 
 struct StackIconButtonStyle: ButtonStyle {
