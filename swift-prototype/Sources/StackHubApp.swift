@@ -50,7 +50,8 @@ final class StackHubAppDelegate: NSObject, NSApplicationDelegate {
             defer: false
         )
         panel.isFloatingPanel = true
-        panel.level = .popUpMenu
+        // Stay above normal windows while allowing native modal alerts above us.
+        panel.level = .floating
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
@@ -81,6 +82,7 @@ final class StackHubAppDelegate: NSObject, NSApplicationDelegate {
     @objc private func togglePanel(_ sender: Any?) {
         guard let button = statusItem?.button, let panelWindow else { return }
         if panelWindow.isVisible {
+            guard !PanelDismissalPolicy.isPresentingModal(panel: panelWindow, modalWindow: NSApp.modalWindow) else { return }
             panelWindow.orderOut(sender)
             removePopoverDismissMonitors()
         } else {
@@ -112,17 +114,20 @@ final class StackHubAppDelegate: NSObject, NSApplicationDelegate {
     private func installPopoverDismissMonitors() {
         removePopoverDismissMonitors()
         localPopoverDismissMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
-            guard let self, self.panelWindow?.isVisible == true else { return event }
-            if event.window !== self.panelWindow {
-                self.panelWindow?.orderOut(nil)
+            guard let self, let panel = self.panelWindow, panel.isVisible else { return event }
+            if PanelDismissalPolicy.shouldDismiss(panel: panel, clickedWindow: event.window, modalWindow: NSApp.modalWindow) {
+                panel.orderOut(nil)
                 self.removePopoverDismissMonitors()
             }
             return event
         }
         globalPopoverDismissMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             DispatchQueue.main.async {
-                self?.panelWindow?.orderOut(nil)
-                self?.removePopoverDismissMonitors()
+                guard let self, let panel = self.panelWindow, panel.isVisible,
+                      PanelDismissalPolicy.shouldDismiss(panel: panel, clickedWindow: nil, modalWindow: NSApp.modalWindow)
+                else { return }
+                panel.orderOut(nil)
+                self.removePopoverDismissMonitors()
             }
         }
     }
@@ -2655,9 +2660,10 @@ struct ServiceLogDetailView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 11) {
+            HStack(spacing: 8) {
                 Button(action: onClose) {
                     Label("返回", systemImage: "chevron.left")
+                        .fixedSize(horizontal: true, vertical: false)
                 }
                 .buttonStyle(StackSecondaryButtonStyle())
                 .controlSize(.small)
@@ -2677,6 +2683,7 @@ struct ServiceLogDetailView: View {
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(service.status.color)
                     .labelStyle(.titleAndIcon)
+                    .fixedSize(horizontal: true, vertical: false)
 
                 Button {
                     store.serviceAction(service)
