@@ -47,11 +47,16 @@ enum AppLocalization {
 
     private static func bundle(for language: AppLanguage) -> Bundle {
         guard language != .system else { return resourceBundle }
-        guard let path = resourceBundle.path(forResource: language.rawValue, ofType: "lproj"),
-              let localizedBundle = Bundle(path: path) else {
-            return resourceBundle
+        // Native SwiftPM lowercases locale directories (zh-hans.lproj), while
+        // Xcode and the app packager preserve zh-Hans.lproj. Resolve an exact
+        // directory instead of invoking Bundle's preferred-language fallback.
+        if let resourceURL = resourceBundle.resourceURL {
+            for identifier in [language.rawValue, language.rawValue.lowercased()] {
+                let directory = resourceURL.appendingPathComponent("\(identifier).lproj", isDirectory: true)
+                if let localizedBundle = Bundle(url: directory) { return localizedBundle }
+            }
         }
-        return localizedBundle
+        return resourceBundle
     }
 
     static func string(_ key: String) -> String {

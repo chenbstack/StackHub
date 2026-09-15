@@ -30,6 +30,16 @@ final class CIActivityOrderingTests: XCTestCase {
         }
     }
 
+    func testLanguageCanSwitchBackToChineseAfterLoadingEnglishResources() {
+        withAppLanguage(.english) {
+            XCTAssertEqual(CIExecutionTimeFormatter.duration(seconds: 125.4), "2 min 5 sec")
+        }
+        withAppLanguage(.simplifiedChinese) {
+            XCTAssertEqual(L("项目"), "项目")
+            XCTAssertEqual(CIExecutionTimeFormatter.duration(seconds: 125.4), "2 分 5 秒")
+        }
+    }
+
     private func withAppLanguage(_ language: AppLanguage, perform body: () -> Void) {
         let defaults = UserDefaults.standard
         let previous = defaults.string(forKey: AppLanguage.storageKey)
