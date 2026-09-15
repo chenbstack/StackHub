@@ -1,0 +1,52 @@
+# StackHub
+
+[English](README.md) | **简体中文**
+
+StackHub 是一款使用 SwiftUI 构建的原生 macOS 菜单栏应用，将命令执行、Shell 脚本运行、本地服务与进程管理，以及 GitHub Actions、GitLab CI 流水线监控集中在一个面板中。
+
+## 界面预览
+
+<table>
+  <tr>
+    <th>本地项目与服务</th>
+    <th>CI 活动</th>
+    <th>全屏运行日志</th>
+  </tr>
+  <tr>
+    <td width="33%" valign="top"><img src="docs/screenshots/projects-sanitized.png" alt="项目服务总览（示例数据）" width="100%"></td>
+    <td width="33%" valign="top"><img src="docs/screenshots/ci-sanitized.png" alt="GitHub Actions 与 GitLab CI 活动（示例数据）" width="100%"></td>
+    <td width="33%" valign="top"><img src="docs/screenshots/logs-sanitized.png" alt="运行日志（示例数据）" width="100%"></td>
+  </tr>
+</table>
+
+*英文版界面，使用示例数据。*
+
+## 功能
+
+- **本地服务** — 启动、停止和重启项目服务，自定义命令、工作目录和端口。
+- **实时日志** — 在独立日志页面查看服务输出，支持 ANSI 彩色日志。
+- **CI 监控** — 关注 GitHub Actions 与多个 GitLab 实例，各自独立刷新，离线时保留缓存。
+- **凭据保护** — GitHub 和 GitLab Token 保存在 macOS 钥匙串中。
+- **应用内更新** — 每小时检查更新，有新版时点击蓝色下载图标即可安装并重启。
+- **双语界面** — 支持简体中文和英文切换。
+
+## 安装
+
+需要 **macOS 14 或更高版本**，发布包适用于 **Apple Silicon**。
+
+1. 从 [GitHub Releases](https://github.com/chenbstack/StackHub/releases/latest) 下载 ZIP。
+2. 解压后将 `StackHub.app` 移入“应用程序”。
+3. 启动并点击菜单栏图标，在“项目”中添加本地服务，或在“CI”中连接 GitHub 和 GitLab。
+
+配置的端口会在服务启动前释放，请只填写属于该服务的端口。退出或安装更新会停止托管服务，需要时请重新启动服务。
+
+## 从源码运行
+
+需要 Xcode 和 Swift 5.9 或更高版本。
+
+```bash
+cd swift-prototype
+swift run StackHub
+```
+
+构建应用包可使用 [scripts/package-app.sh](scripts/package-app.sh)。
