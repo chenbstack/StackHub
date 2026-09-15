@@ -27,9 +27,9 @@ jobs:
 
           echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
-      - name: Build release executable
+      - name: Run tests
         working-directory: swift-prototype
-        run: swift build -c release
+        run: swift test --disable-sandbox
 
       - name: Assemble and verify app bundle
         shell: bash
@@ -37,19 +37,19 @@ jobs:
           app_path="release/StackHub.app"
           archive_path="release/StackHub-${VERSION}-macos-arm64.zip"
 
-          mkdir -p "$app_path/Contents/MacOS"
-          mkdir -p "$app_path/Contents/Resources"
-          cp swift-prototype/.build/release/StackHub "$app_path/Contents/MacOS/StackHub"
-          cp swift-prototype/Packaging/Info.plist "$app_path/Contents/Info.plist"
-          cp -R swift-prototype/Sources/Localization/. "$app_path/Contents/Resources"
-
-          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$app_path/Contents/Info.plist"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $GITHUB_RUN_NUMBER" "$app_path/Contents/Info.plist"
-
-          codesign --force --deep --sign - "$app_path"
-          codesign --verify --deep --strict "$app_path"
+          bash scripts/package-app.sh "$VERSION" release
           ditto -c -k --sequesterRsrc --keepParent "$app_path" "$archive_path"
           shasum -a 256 "$archive_path"
+
+      - name: Generate signed Sparkle feed
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          if [[ -z "$SPARKLE_PRIVATE_KEY" ]]; then
+            echo "Missing SPARKLE_PRIVATE_KEY repository secret." >&2
+            exit 1
+          fi
+          bash scripts/generate-update-feed.sh "$VERSION" release
 
       - name: Publish GitHub Release
         env:
@@ -60,9 +60,18 @@ jobs:
           asset_label="StackHub-${VERSION}-macos-arm64.zip"
 
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "$archive_path#$asset_label" --clobber
+            gh release upload "$GITHUB_REF_NAME" "$archive_path#$asset_label" release/appcast.xml --clobber
           else
-            gh release create "$GITHUB_REF_NAME" "$archive_path#$asset_label" \
+            release_flags=()
+            if [[ "$VERSION" == *-* ]]; then
+              release_flags+=(--prerelease)
+            fi
+            if [[ -f "docs/releases/${GITHUB_REF_NAME}.md" ]]; then
+              release_flags+=(--notes-file "docs/releases/${GITHUB_REF_NAME}.md")
+            else
+              release_flags+=(--generate-notes)
+            fi
+            gh release create "$GITHUB_REF_NAME" "$archive_path#$asset_label" release/appcast.xml \
               --title "StackHub $VERSION" \
-              --generate-notes
+              --verify-tag "${release_flags[@]}"
           fi

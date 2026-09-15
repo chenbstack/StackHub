@@ -27,6 +27,7 @@ StackHub 是一款原生 SwiftUI 菜单栏应用：在一个小面板中管理�
 - 项目页直接添加、编辑和移除本地项目；CI 页直接管理 GitHub 授权和 GitLab 实例，无独立设置页。
 - GitHub Actions 支持浏览器 Device Flow OAuth 和增量仓库同步；GitLab 支持多个实例及完整发现。
 - CI 凭据保存在 macOS 钥匙串的单一加密凭据包中；旧版独立条目在首次实际使用时按需迁移。
+- 使用 Sparkle 检查 GitHub Release：启动时及每小时检查一次；发现新版仅在右上角显示小蓝色下载按钮，点击后下载、校验、安装并重启。
 
 ## 运行
 
@@ -76,4 +77,28 @@ cd swift-prototype
 swift build -c release
 ```
 
-发布可执行文件位于 `.build/release/StackHub`。若需要 macOS `.app` 包，请以 `dist/StackHub.app/Contents/MacOS/StackHub` 为目标替换该可执行文件后进行代码签名。
+应用包还需要嵌入 Sparkle.framework 及其安装辅助程序。请在仓库根目录使用统一打包脚本，输出目录应为空：
+
+```bash
+bash scripts/package-app.sh 1.0.3 /tmp/stackhub-release-1.0.3
+```
+
+命令行工具链缺少 SwiftUI 插件时，在命令前加 `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`。
+
+### 自动更新发布
+
+- [Sparkle 2.10.0](https://sparkle-project.org/documentation/) 已锁定在 `Package.resolved`；应用使用自定义用户界面，仅显示面板按钮，不弹出后台更新通知。
+- 语言和下载按钮默认透明，悬停或按下时显示底色。下载过程中显示进度，失败后可重试。
+- 更新源为 [GitHub Release 的 appcast.xml](https://github.com/chenbstack/StackHub/releases/latest/download/appcast.xml)。没有更新或索引暂不可用时，不显示按钮。
+- `SUEnableAutomaticChecks=true`、`SUScheduledCheckInterval=3600`；禁止后台自动下载，不发送系统配置统计。
+- 更新包和索引使用 Ed25519 签名，公钥嵌入 `Packaging/Info.plist`。本机私钥由 Sparkle 保存在钥匙串账号 `com.stackhub.prototype.updates` 中，私钥不能提交到仓库。
+- GitHub Actions 需要仓库 Secret `SPARKLE_PRIVATE_KEY`。发布流程打包框架、使用版本号设置 `CFBundleVersion`、签名 ZIP 与 appcast，然后将两者上传至同一 Release。预发布使用 beta channel，不进入默认稳定版更新源。
+- 旧 Release 没有更新索引；首次发布包含上述流程的新版后，GitHub 更新源才会可用。尚未内置 Sparkle 的旧应用需要手动安装一次新版。
+- 点击更新后的重启会经过应用正常退出流程，停止 StackHub 管理的本地服务；重新打开后不会自动启动这些服务。
+
+本机生成更新索引时，可直接使用钥匙串签名，无需导出私钥：
+
+```bash
+ditto -c -k --sequesterRsrc --keepParent /tmp/stackhub-release-1.0.3/StackHub.app /tmp/stackhub-release-1.0.3/StackHub-1.0.3-macos-arm64.zip
+bash scripts/generate-update-feed.sh 1.0.3 /tmp/stackhub-release-1.0.3
+```

@@ -10,6 +10,7 @@ private final class StackHubPanelWindow: NSPanel {
 @MainActor
 final class StackHubAppDelegate: NSObject, NSApplicationDelegate {
     let store = StackHubStore()
+    private let appUpdater = AppUpdater()
     private var statusItem: NSStatusItem?
     private var panelWindow: NSPanel?
     private var statusObservation: AnyCancellable?
@@ -18,6 +19,7 @@ final class StackHubAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installStatusItem()
+        appUpdater.start()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -68,7 +70,7 @@ final class StackHubAppDelegate: NSObject, NSApplicationDelegate {
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         panel.contentViewController = NSHostingController(
-            rootView: StackHubPanel().environmentObject(store)
+            rootView: StackHubPanel().environmentObject(store).environmentObject(appUpdater)
         )
         panelWindow = panel
 
@@ -201,9 +203,11 @@ struct LanguageSelector: View {
             }
         } label: {
             Image(systemName: "globe")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.white.opacity(0.8))
                 .frame(width: 28, height: 28)
         }
-        .buttonStyle(StackIconButtonStyle())
+        .buttonStyle(PanelHeaderIconButtonStyle())
         .help(L("切换语言"))
         .accessibilityLabel(L("切换语言"))
     }
@@ -1977,6 +1981,7 @@ final class StackHubStore: ObservableObject {
 
 struct StackHubPanel: View {
     @EnvironmentObject private var store: StackHubStore
+    @EnvironmentObject private var appUpdater: AppUpdater
     @StateObject private var settingsState = SettingsPanelState()
     @StateObject private var githubOAuth = GitHubOAuthController()
     @State private var selectedDestination: PanelDestination?
@@ -2029,6 +2034,12 @@ struct StackHubPanel: View {
         .preferredColorScheme(.dark)
         .foregroundStyle(.white)
         .animation(.easeOut(duration: 0.18), value: store.toast)
+        .alert(item: Binding(
+            get: { appUpdater.driver.failure },
+            set: { appUpdater.driver.failure = $0 }
+        )) { failure in
+            Alert(title: Text(L("更新失败")), message: Text(failure.message), dismissButton: .default(Text(L("好"))))
+        }
         .onChange(of: store.tab) { _, tab in
             if tab == .ci { store.acknowledgeCIFailures() }
         }
@@ -2093,13 +2104,7 @@ struct StackHubPanel: View {
             }
             Spacer()
             LanguageSelector()
-            HStack(spacing: 7) {
-                Circle().fill(.green).frame(width: 8, height: 8)
-                Text("健康").font(.caption.weight(.medium)).foregroundStyle(.green.opacity(0.9))
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(.green.opacity(0.09), in: Capsule())
+            AppUpdateButton()
         }
         .padding(.horizontal, 20)
         .padding(.top, 22)

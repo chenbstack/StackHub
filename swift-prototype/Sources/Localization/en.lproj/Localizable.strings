@@ -253,3 +253,13 @@
 "GitLab 凭据更新失败" = "Could not update GitLab credentials";
 "请先填写 GitHub OAuth Client ID，并在 OAuth App 设置中开启 Device Flow。" = "Enter a GitHub OAuth Client ID and enable Device Flow in the OAuth App settings.";
 "GitHub 授权码已过期，请重新开始浏览器授权。" = "The GitHub device code expired. Start browser authorization again.";
+
+"下载 %@ 并重启" = "Download %@ and restart";
+"正在检查更新…" = "Checking for updates…";
+"正在下载更新…" = "Downloading update…";
+"正在下载更新：%ld%%" = "Downloading update: %ld%%";
+"正在验证并准备更新…" = "Verifying and preparing update…";
+"正在安装，即将重启…" = "Installing; restarting shortly…";
+"此版本无法自动安装，请查看 GitHub Release。" = "This version cannot be installed automatically. See GitHub Releases.";
+"更新失败" = "Update failed";
+"好" = "OK";

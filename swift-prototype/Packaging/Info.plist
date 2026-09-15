@@ -33,5 +33,21 @@
     <true/>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <key>SUFeedURL</key>
+    <string>https://github.com/chenbstack/StackHub/releases/latest/download/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>nEXUsb+OrCuif0owaVC2eNOZLSKSjt6Y8rJocgtsAlE=</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUScheduledCheckInterval</key>
+    <integer>3600</integer>
+    <key>SUAutomaticallyUpdate</key>
+    <false/>
+    <key>SUSendProfileInfo</key>
+    <false/>
+    <key>SUVerifyUpdateBeforeExtraction</key>
+    <true/>
+    <key>SURequireSignedFeed</key>
+    <true/>
 </dict>
 </plist>
