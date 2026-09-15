@@ -81,24 +81,18 @@ enum CIPipelineCache {
 func prefetchPipelineStages(
     candidates: [(String, Pipeline)],
     limit: Int,
-    fetchJobs: @escaping (Pipeline) async -> [RemoteJob]
-) async -> [String: Pipeline] {
+    fetchJobs: @escaping (Pipeline) async throws -> [RemoteJob]
+) async rethrows -> [String: Pipeline] {
     let selected = Array(candidates
         .sorted { CIActivityOrdering.newestFirst($0.1, $1.1) }
         .prefix(max(limit, 0)))
     guard !selected.isEmpty else { return [:] }
 
     var result: [String: Pipeline] = [:]
-    for start in stride(from: 0, to: selected.count, by: 4) {
-        let end = min(start + 4, selected.count)
-        let batch = Array(selected[start..<end])
-        var fetched: [(String, Pipeline?)] = []
-        for (projectID, pipeline) in batch {
-            let jobs = await fetchJobs(pipeline)
-            fetched.append((projectID, CIPipelineCache.withJobs(pipeline, jobs: jobs)))
-        }
-        for (projectID, pipeline) in fetched {
-            if let pipeline { result[projectID] = pipeline }
+    for (projectID, pipeline) in selected {
+        let jobs = try await fetchJobs(pipeline)
+        if let staged = CIPipelineCache.withJobs(pipeline, jobs: jobs) {
+            result[projectID] = staged
         }
     }
     return result

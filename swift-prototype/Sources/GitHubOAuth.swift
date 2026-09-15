@@ -36,7 +36,7 @@ final class GitHubOAuthController: ObservableObject {
     private let client: GitHubOAuthClient
     private var pollingTask: Task<Void, Never>?
 
-    init(session: URLSession = .shared) {
+    init(session: URLSession = CIHTTPTransport.session) {
         let savedClientID = UserDefaults.standard.string(forKey: GitHubOAuthConfiguration.clientIDKey)?.trimmingCharacters(in: .whitespacesAndNewlines)
         clientID = savedClientID?.isEmpty == false ? savedClientID! : GitHubOAuthConfiguration.defaultClientID
         client = GitHubOAuthClient(session: session)
@@ -141,7 +141,7 @@ final class GitHubOAuthClient {
     }
 
     fileprivate func requestDeviceCode(clientID: String) async throws -> DeviceCodeResponse {
-        var request = URLRequest(url: URL(string: "https://github.com/login/device/code")!, timeoutInterval: 10)
+        var request = URLRequest(url: URL(string: "https://github.com/login/device/code")!, timeoutInterval: CIHTTPTransport.timeout)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
@@ -152,7 +152,7 @@ final class GitHubOAuthClient {
     }
 
     fileprivate func pollAccessToken(clientID: String, deviceCode: String) async throws -> PollResult {
-        var request = URLRequest(url: URL(string: "https://github.com/login/oauth/access_token")!, timeoutInterval: 10)
+        var request = URLRequest(url: URL(string: "https://github.com/login/oauth/access_token")!, timeoutInterval: CIHTTPTransport.timeout)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
@@ -181,7 +181,7 @@ final class GitHubOAuthClient {
     }
 
     func refreshAccessToken(clientID: String, refreshToken: String) async throws -> GitHubOAuthCredential {
-        var request = URLRequest(url: URL(string: "https://github.com/login/oauth/access_token")!, timeoutInterval: 10)
+        var request = URLRequest(url: URL(string: "https://github.com/login/oauth/access_token")!, timeoutInterval: CIHTTPTransport.timeout)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")

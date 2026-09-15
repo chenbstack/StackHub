@@ -686,9 +686,19 @@ final class StackHubStore: ObservableObject {
     private var credentialBundle = CredentialBundle()
     private var didLoadCredentialBundle = false
     private let defaults: UserDefaults
+    private let ciSession: URLSession
+    private let ciCredentialProvider: CICredentialProvider?
+    private let ciRefreshScheduler: CIRefreshScheduler
+    private var ciRefreshTasks: [CISource: Task<Void, Never>] = [:]
+    private var ciSourceErrors: [CISource: String] = [:]
+    private var offlineCISources: Set<CISource> = []
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, ciSession: URLSession = CIHTTPTransport.session,
+         ciCredentialProvider: CICredentialProvider? = nil, ciRefreshScheduler: CIRefreshScheduler? = nil) {
         self.defaults = defaults
+        self.ciSession = ciSession
+        self.ciCredentialProvider = ciCredentialProvider
+        self.ciRefreshScheduler = ciRefreshScheduler ?? CIRefreshScheduler()
         loadPersistedState()
         loadCredentialMetadata()
         selectedInstanceID = instances.first?.id
@@ -855,6 +865,7 @@ final class StackHubStore: ObservableObject {
     }
 
     private func clearGitLabRefreshState(for instanceID: UUID) {
+        invalidateCIRefresh(.gitlab(instanceID))
         let instanceKey = instanceID.uuidString
         gitLabPipelineSyncDates.removeValue(forKey: instanceKey)
         gitLabGlobalPipelineCapabilities.removeValue(forKey: instanceKey)
@@ -889,7 +900,7 @@ final class StackHubStore: ObservableObject {
         }
     }
 
-    func saveGitHubCredential(_ credential: GitHubOAuthCredential) {
+    func saveGitHubCredential(_ credential: GitHubOAuthCredential, resetProjectIndex: Bool = true) {
         let trimmed = credential.accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         do {
@@ -912,7 +923,7 @@ final class StackHubStore: ObservableObject {
             }
             isGitHubConnected = true
             defaults.set(true, forKey: Self.githubConnectedMetadataKey)
-            invalidateGitHubProjectIndex()
+            if resetProjectIndex { invalidateGitHubProjectIndex() }
             // The settings page reflects the connected state. Avoid a
             // persistent success toast in the menu-bar footer.
             toast = nil
@@ -923,6 +934,7 @@ final class StackHubStore: ObservableObject {
     }
 
     private func invalidateGitHubProjectIndex() {
+        invalidateCIRefresh(.github)
         // Reauthorization may select another account; never reuse its predecessor's
         // owner-only index or pipeline data.
         accessibleCIProjects.removeAll { $0.provider == "GitHub Actions" }
@@ -949,6 +961,7 @@ final class StackHubStore: ObservableObject {
         UserDefaults.standard.removeObject(forKey: GitHubOAuthConfiguration.accessTokenExpiryKey)
         githubAccessTokenCache = nil
         githubRefreshTokenCache = nil
+        invalidateCIRefresh(.github)
         isGitHubConnected = false
         defaults.set(false, forKey: Self.githubConnectedMetadataKey)
         accessibleCIProjects.removeAll { $0.provider == "GitHub Actions" }
@@ -961,351 +974,431 @@ final class StackHubStore: ObservableObject {
     }
 
     func refreshCI(forceProjectDiscovery: Bool = false) {
-        guard !isRefreshingCI else { return }
-        isRefreshingCI = true
-        ciError = nil
-        let cachedProjects = accessibleCIProjects
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            // Keep the visual refresh state recoverable even if a future
-            // early return or an unexpected thrown error bypasses the normal
-            // completion path below.
-            defer { self.isRefreshingCI = false }
-            var projects: [CIAccessibleProject] = []
-            var pipelines: [String: [Pipeline]] = self.pipelineCache
-            var errors: [String] = []
-            var didDiscover = false
-            var didGitHubRepositorySync = false
-            var didGitHubFullDiscovery = false
-            let profiler = CIRefreshProfiler()
-
-                if let token = await self.githubAccessTokenForRequest(), !token.isEmpty {
-                    let cachedGitHubProjects = cachedProjects.filter { $0.provider == "GitHub Actions" && $0.isInRepositoryScope }
-                    var githubProjects = cachedGitHubProjects
-                    do {
-                        let client = GitHubAPIClient(token: token)
-                        // GitHub's repository list supports `since`, so only
-                        // repositories changed since the previous sync need an
-                        // Actions-runs request. Keep the first sync and an
-                        // explicit force refresh bounded to the recent scope.
-                        let fullDiscovery = forceProjectDiscovery || lastGitHubRepositorySync == nil || cachedGitHubProjects.isEmpty ||
-                            lastGitHubFullDiscovery.map { Date().timeIntervalSince($0) > Self.githubFullDiscoveryInterval } ?? true
-                        let discovered = try await profiler.measure("GitHub · 仓库索引", requests: 1) {
-                            try await client.ownedProjects(
-                                limit: fullDiscovery ? Self.githubRepositoryLimit : 100,
-                                since: fullDiscovery ? nil : self.lastGitHubRepositorySync?.addingTimeInterval(-60)
-                            )
-                        }
-                        let changed = discovered.map {
-                            CIAccessibleProject(
-                                id: $0.id, name: $0.name, provider: $0.provider,
-                                repository: $0.repository, branch: $0.branch,
-                                instanceName: nil, updatedAt: $0.updatedAt,
-                                isOwnedByCurrentUser: true
-                            )
-                        }
-                        if fullDiscovery {
-                            githubProjects = Array(changed.prefix(Self.githubRepositoryLimit))
-                        } else {
-                            githubProjects = CIActivityOrdering.mergedRecentProjects(
-                                changed: changed,
-                                cached: cachedGitHubProjects,
-                                limit: Self.githubRepositoryLimit
-                            )
-                        }
-                        projects.append(contentsOf: githubProjects)
-
-                        let projectsToRefresh: [CIAccessibleProject]
-                        if fullDiscovery {
-                            projectsToRefresh = githubProjects
-                        } else {
-                            projectsToRefresh = CIActivityOrdering.projectsRequiringPipelineRefresh(
-                                changed: changed,
-                                retained: githubProjects
-                            )
-                        }
-                        // Keep refreshes serial. The menu-bar app also reads
-                        // credentials from the main actor; avoiding a task
-                        // group here prevents Swift concurrency callbacks
-                        // from racing Security.framework access.
-                        var didFetchAllChangedPipelines = true
-                        for start in stride(from: 0, to: projectsToRefresh.count, by: 6) {
-                            let end = min(start + 6, projectsToRefresh.count)
-                            let batch = Array(projectsToRefresh[start..<end])
-                            for project in batch {
-                                let parts = project.repository.split(separator: "/", maxSplits: 1).map(String.init)
-                                guard parts.count == 2 else { continue }
-                                do {
-                                    let remote = try await profiler.measure("GitHub · 流水线", requests: 1) {
-                                        try await client.recentRuns(owner: parts[0], repository: parts[1], projectID: project.id)
-                                    }
-                                    let refreshed = remote.map(self.makePipeline)
-                                    let previous = pipelines[project.id] ?? []
-                                    pipelines[project.id] = refreshed.map { pipeline in
-                                        CIPipelineCache.merging(pipeline, with: previous.first { $0.id == pipeline.id })
-                                    }
-                                } catch {
-                                    // Do not advance the repository cursor: this
-                                    // change must be retried on the next refresh.
-                                    didFetchAllChangedPipelines = false
-                                    errors.append("GitHub \(project.repository)：\(error.localizedDescription)")
-                                }
-                            }
-                        }
-                        didGitHubRepositorySync = didFetchAllChangedPipelines
-                        didGitHubFullDiscovery = fullDiscovery && didFetchAllChangedPipelines
-                    } catch { errors.append("GitHub：\(error.localizedDescription)") }
-                    // Keep cached GitHub projects visible if the incremental
-                    // repository request failed temporarily.
-                    if githubProjects.isEmpty { projects.append(contentsOf: cachedGitHubProjects) }
-                }
-
-                for instance in self.instances {
-                    guard let token = self.gitLabToken(for: instance) else { continue }
-                    do {
-                        let client = try GitLabAPIClient(instanceURL: instance.host, token: token, projectIDPrefix: instance.id.uuidString)
-                        let syncKey = instance.id.uuidString
-                        let instanceProjectPrefix = "gitlab:\(syncKey):"
-                        var gitLabProjects = cachedProjects.filter {
-                            $0.provider == "GitLab CI" && $0.instanceName == instance.name
-                        }
-                        var advancesPipelineCursor = false
-                        var remotePipelines: [RemotePipeline] = []
-
-                        if self.gitLabGlobalPipelineCapabilities[syncKey] != false {
-                            do {
-                            // GitLab has a cross-project pipeline feed, so the
-                            // normal path starts here rather than enumerating
-                            // `/projects`. Its cursor is creation-based; a
-                            // short overlap handles requests at the boundary.
-                            let cursor = forceProjectDiscovery ? nil : self.gitLabPipelineSyncDates[syncKey]
-                            let createdAfter = cursor?.addingTimeInterval(-Self.gitLabPipelineSyncOverlap)
-                            remotePipelines = try await profiler.measure("\(instance.name) · 全局流水线", requests: 1) {
-                                try await client.recentPipelines(limit: 100, createdAfter: createdAfter)
-                            }
-                            advancesPipelineCursor = true
-                            self.gitLabGlobalPipelineCapabilities[syncKey] = true
-
-                            // The global cursor only returns newly created
-                            // pipelines. Refresh cached running ones directly
-                            // so their final result still reaches the card.
-                            let runningCached = pipelines.values
-                                .flatMap { $0 }
-                                .filter { $0.provider == "GitLab CI" && $0.projectID.hasPrefix(instanceProjectPrefix) && $0.state == .running }
-                            for pipeline in runningCached {
-                                let pipelineID = pipeline.id.split(separator: "-").last.map(String.init) ?? pipeline.id
-                                let refreshed = try? await profiler.measure("\(instance.name) · 运行中流水线", requests: 1) {
-                                    try await client.pipeline(projectID: pipeline.projectID, pipelineID: pipelineID)
-                                }
-                                if let refreshed {
-                                    remotePipelines.append(refreshed)
-                                }
-                            }
-                            } catch let CIIntegrationError.http(code, _) where code == 404 || code == 405 {
-                                // The authenticated probe confirms that this
-                                // instance is older than the cross-project API.
-                                // Persist it so later polls do not repeat 404.
-                                self.gitLabGlobalPipelineCapabilities[syncKey] = false
-                            } catch {
-                                throw error
-                            }
-                        }
-
-                        if self.gitLabGlobalPipelineCapabilities[syncKey] == false {
-                            // Old GitLab has no instance-wide activity feed.
-                            // Reuse its persisted project index; only a first
-                            // sync or an explicit discovery refresh enumerates
-                            // `/projects` again.
-                            if forceProjectDiscovery || gitLabProjects.isEmpty {
-                                let discovered = try await profiler.measure("\(instance.name) · 项目索引（兼容）", requests: 1) {
-                                    try await client.accessibleProjects()
-                                }
-                                gitLabProjects = discovered.map {
-                                    CIAccessibleProject(
-                                        id: $0.id, name: $0.name, provider: $0.provider,
-                                        repository: $0.repository, branch: $0.branch,
-                                        instanceName: instance.name
-                                    )
-                                }
-                                didDiscover = true
-                            }
-                            let fallbackProjects = Array(gitLabProjects.prefix(GitLabAPIClient.legacyFallbackProjectLimit))
-                            for project in fallbackProjects {
-                                let projectSyncKey = "\(syncKey):\(project.id)"
-                                let cachedCursor = pipelines[project.id]?.compactMap(\.updatedAt).max()
-                                let cursor = forceProjectDiscovery ? nil : (self.gitLabProjectPipelineSyncDates[projectSyncKey] ?? cachedCursor)
-                                let syncStartedAt = Date()
-                                do {
-                                    let projectPipelines = try await profiler.measure("\(instance.name) · 项目流水线（兼容）", requests: 1) {
-                                        try await client.recentPipelines(
-                                            projectID: project.id,
-                                            limit: cursor == nil ? 5 : 100,
-                                            updatedAfter: cursor
-                                        )
-                                    }
-                                    remotePipelines.append(contentsOf: projectPipelines)
-                                    // Advance only after a successful response;
-                                    // a failed request remains eligible next time.
-                                    self.gitLabProjectPipelineSyncDates[projectSyncKey] = syncStartedAt
-                                } catch {
-                                    errors.append("\(instance.name) \(project.repository)：\(error.localizedDescription)")
-                                }
-                            }
-                        }
-
-                        // A global response can contain the same running
-                        // pipeline as the direct refresh above. Let the direct
-                        // response win and never duplicate the card.
-                        var remotesByID: [String: RemotePipeline] = [:]
-                        for remote in remotePipelines {
-                            remotesByID["\(remote.projectID):\(remote.id)"] = remote
-                        }
-                        remotePipelines = Array(remotesByID.values)
-
-                        // New GitLab versions include `project` metadata in
-                        // the global feed. For older responses, resolve only
-                        // those individual unseen project IDs, never the full
-                        // project list.
-                        var projectsByID = Dictionary(uniqueKeysWithValues: gitLabProjects.map { ($0.id, $0) })
-                        var resolvedAllProjects = true
-                        for remote in remotePipelines where projectsByID[remote.projectID] == nil {
-                            if let project = self.makeGitLabProject(remote, instance: instance) {
-                                projectsByID[project.id] = project
-                            } else {
-                                do {
-                                    let resolved = try await profiler.measure("\(instance.name) · 项目元数据", requests: 1) {
-                                        try await client.project(projectID: remote.projectID)
-                                    }
-                                    projectsByID[remote.projectID] = CIAccessibleProject(
-                                        id: remote.projectID, name: resolved.name, provider: resolved.provider,
-                                        repository: resolved.repository, branch: resolved.branch,
-                                        instanceName: instance.name
-                                    )
-                                } catch {
-                                    resolvedAllProjects = false
-                                    errors.append("\(instance.name)：\(error.localizedDescription)")
-                                }
-                            }
-                        }
-
-                        var orderedProjectIDs: [String] = []
-                        for remote in remotePipelines where projectsByID[remote.projectID] != nil {
-                            if !orderedProjectIDs.contains(remote.projectID) { orderedProjectIDs.append(remote.projectID) }
-                        }
-                        for project in gitLabProjects where projectsByID[project.id] != nil {
-                            if !orderedProjectIDs.contains(project.id) { orderedProjectIDs.append(project.id) }
-                        }
-                        gitLabProjects = orderedProjectIDs.compactMap { projectsByID[$0] }
-                        projects.append(contentsOf: gitLabProjects)
-
-                        let cacheMergeStartedAt = Date()
-                        let grouped = Dictionary(grouping: remotePipelines, by: \.projectID)
-                        for (projectID, remotes) in grouped {
-                            guard let project = projectsByID[projectID] else { continue }
-                            let refreshed = remotes.map { self.makePipeline($0, project: project) }
-                            pipelines[projectID] = CIPipelineCache.mergingRecent(
-                                refreshed, with: pipelines[projectID] ?? []
-                            )
-                        }
-                        profiler.record("本地索引与缓存合并", duration: Date().timeIntervalSince(cacheMergeStartedAt))
-
-                        // GitLab's list endpoint omits duration and start time
-                        // on older instances. Fill those fields only for the
-                        // current completed pipeline of a followed project,
-                        // then retain the detail in the local cache. This is
-                        // at most one extra request per affected card, not a
-                        // history-wide re-query on every refresh.
-                        let followedProjectIDs = Set(self.ciProjects.compactMap { project in
-                            project.provider == "GitLab CI" && project.instanceName == instance.name ? project.id : nil
-                        })
-                        for projectID in followedProjectIDs {
-                            guard let project = projectsByID[projectID],
-                                  let latest = pipelines[projectID]?.sorted(by: CIActivityOrdering.newestFirst).first,
-                                  latest.duration == "—",
-                                  latest.state != .running else { continue }
-                            let pipelineID = latest.id.split(separator: "-").last.map(String.init) ?? latest.id
-                            let detailed = try? await profiler.measure("\(instance.name) · 关注流水线详情（耗时）", requests: 1) {
-                                try await client.pipeline(projectID: projectID, pipelineID: pipelineID)
-                            }
-                            guard let detailed else { continue }
-                            let refreshed = self.makePipeline(detailed, project: project)
-                            pipelines[projectID] = CIPipelineCache.mergingRecent(
-                                [refreshed], with: pipelines[projectID] ?? []
-                            )
-                        }
-
-                        // Re-fetch jobs only for a newly seen pipeline or one
-                        // still in flight. Completed, already-loaded jobs stay
-                        // in the local cache and add no request to this cycle.
-                        var stageCandidates: [(String, Pipeline)] = []
-                        var stageCandidateIDs = Set<String>()
-                        for remote in remotePipelines {
-                            guard let pipeline = pipelines[remote.projectID]?.first(where: { $0.id == remote.id }),
-                                  pipeline.state == .running || !pipeline.hasLoadedStages else { continue }
-                            let key = "\(remote.projectID):\(pipeline.id)"
-                            if stageCandidateIDs.insert(key).inserted {
-                                stageCandidates.append((remote.projectID, pipeline))
-                            }
-                        }
-                        let stageUpdates = await prefetchPipelineStages(
-                            candidates: stageCandidates,
-                            limit: Self.stagePrefetchProjectLimit
-                        ) { pipeline in
-                            let pipelineID = pipeline.id.split(separator: "-").last.map(String.init) ?? pipeline.id
-                            return await profiler.measure("\(instance.name) · 作业步骤", requests: 1) {
-                                (try? await client.jobs(projectID: pipeline.projectID, pipelineID: pipelineID)) ?? []
-                            }
-                        }
-                        for (projectID, staged) in stageUpdates {
-                            pipelines[projectID] = CIPipelineCache.mergingRecent(
-                                [staged], with: pipelines[projectID] ?? []
-                            )
-                        }
-                        if advancesPipelineCursor && resolvedAllProjects {
-                            self.gitLabPipelineSyncDates[syncKey] = Date()
-                        }
-                    } catch {
-                        // Keep locally discovered GitLab projects and cached
-                        // pipeline cards visible when a refresh fails.
-                        projects.append(contentsOf: cachedProjects.filter {
-                            $0.provider == "GitLab CI" && $0.instanceName == instance.name
-                        })
-                        errors.append("\(instance.name)：\(error.localizedDescription)")
-                    }
-                }
-
-            let uniqueProjects = CIActivityOrdering.uniqueProjects(projects)
-            let validIDs = Set(uniqueProjects.map(\.id))
-            self.accessibleCIProjects = uniqueProjects
-            self.pipelineCache = pipelines.filter { validIDs.contains($0.key) }
-            self.reconcileAcknowledgedFailures()
-            if didDiscover {
-                self.lastCIProjectDiscovery = Date()
-                self.defaults.set(Self.projectIndexOrderVersion, forKey: Self.projectIndexOrderVersionKey)
-            }
-            if didGitHubRepositorySync { self.lastGitHubRepositorySync = Date() }
-            if didGitHubFullDiscovery { self.lastGitHubFullDiscovery = Date() }
-            self.lastCIRefresh = Date()
-            let persistenceStartedAt = Date()
-            self.persistCIState()
-            profiler.record("保存本地状态", duration: Date().timeIntervalSince(persistenceStartedAt))
-            if !errors.isEmpty { self.ciError = errors.joined(separator: "\n") }
-            CIRefreshDiagnostics.write(
-                profiler.report(
-                    projectCount: uniqueProjects.count,
-                    pipelineCount: self.pipelineCache.values.reduce(0) { $0 + $1.count },
-                    errorCount: errors.count
-                )
-            )
-            // 刷新结果由页面更新时间和列表表达，不再弹出项目数量提示。
-        }
+        scheduleCIRefresh(manual: true, forceProjectDiscovery: forceProjectDiscovery)
     }
 
     func refreshCIIfNeeded() {
-        guard !isRefreshingCI else { return }
-        let needsRefresh = accessibleCIProjects.isEmpty || lastCIRefresh.map { Date().timeIntervalSince($0) >= Self.ciRefreshInterval } ?? true
-        guard needsRefresh else { return }
-        refreshCI()
+        scheduleCIRefresh(manual: false, forceProjectDiscovery: false)
+    }
+
+    private func scheduleCIRefresh(manual: Bool, forceProjectDiscovery: Bool) {
+        // Create every source task before awaiting any network response. Token
+        // reads and result publication remain serialized on the main actor.
+        startCIRefresh(source: .github, manual: manual) { requestID in
+            await self.refreshGitHub(requestID: requestID, forceProjectDiscovery: forceProjectDiscovery)
+        }
+        for instance in instances {
+            startCIRefresh(source: .gitlab(instance.id), manual: manual) { requestID in
+                await self.refreshGitLab(instance, requestID: requestID, forceProjectDiscovery: forceProjectDiscovery)
+            }
+        }
+    }
+
+    private func startCIRefresh(source: CISource, manual: Bool, operation: @escaping @MainActor (UUID) async -> Void) {
+        guard let requestID = ciRefreshScheduler.begin(source, manual: manual) else { return }
+        isRefreshingCI = true
+        ciRefreshTasks[source] = Task { @MainActor [weak self] in
+            await operation(requestID)
+            guard let self, self.ciRefreshScheduler.isCurrent(source, requestID: requestID) else { return }
+            self.ciRefreshScheduler.finish(source, requestID: requestID, connectionFailed: self.offlineCISources.contains(source))
+            self.ciRefreshTasks.removeValue(forKey: source)
+            self.isRefreshingCI = self.ciRefreshScheduler.isRefreshing
+        }
+    }
+
+    private func invalidateCIRefresh(_ source: CISource) {
+        ciRefreshTasks.removeValue(forKey: source)?.cancel()
+        ciRefreshScheduler.invalidate(source)
+        offlineCISources.remove(source)
+        ciSourceErrors.removeValue(forKey: source)
+        ciError = ciSourceErrors.isEmpty ? nil : ciSourceErrors.values.sorted().joined(separator: "\n")
+        isRefreshingCI = ciRefreshScheduler.isRefreshing
+    }
+
+    private func publishCIResult(source: CISource, requestID: UUID, projects: [CIAccessibleProject], pipelines: [String: [Pipeline]]) {
+        guard ciRefreshScheduler.isCurrent(source, requestID: requestID), !Task.isCancelled else { return }
+        let uniqueProjects = CIActivityOrdering.uniqueProjects(projects)
+        let validIDs = Set(uniqueProjects.map(\.id))
+        accessibleCIProjects = CIActivityOrdering.uniqueProjects(
+            accessibleCIProjects.filter { !source.contains(projectID: $0.id) } + uniqueProjects
+        )
+        // Merge against the live cache, never replace another source's result
+        // with the snapshot taken before a slow request. Retain demand-loaded logs.
+        var updatedCache = pipelineCache.filter { !source.contains(projectID: $0.key) || validIDs.contains($0.key) }
+        for (projectID, refreshed) in pipelines where source.contains(projectID: projectID) && validIDs.contains(projectID) {
+            updatedCache[projectID] = refreshed.map { pipeline in
+                CIPipelineCache.merging(pipeline, with: updatedCache[projectID]?.first { $0.id == pipeline.id })
+            }
+        }
+        pipelineCache = updatedCache
+        reconcileAcknowledgedFailures()
+        lastCIRefresh = Date()
+    }
+
+    private func finishCIRefresh(source: CISource, requestID: UUID, connectionFailed: Bool, errors: [String], profiler: CIRefreshProfiler) {
+        guard ciRefreshScheduler.isCurrent(source, requestID: requestID), !Task.isCancelled else { return }
+        if connectionFailed { offlineCISources.insert(source) }
+        else { offlineCISources.remove(source) }
+        ciSourceErrors[source] = errors.isEmpty ? nil : errors.joined(separator: "\n")
+        ciError = ciSourceErrors.isEmpty ? nil : ciSourceErrors.values.sorted().joined(separator: "\n")
+        let persistenceStartedAt = Date()
+        persistCIState()
+        profiler.record("保存本地状态", duration: Date().timeIntervalSince(persistenceStartedAt))
+        CIRefreshDiagnostics.write(profiler.report(
+            projectCount: accessibleCIProjects.filter { source.contains(projectID: $0.id) }.count,
+            pipelineCount: pipelineCache.filter { source.contains(projectID: $0.key) }.values.reduce(0) { $0 + $1.count },
+            errorCount: errors.count
+        ))
+    }
+
+    private func refreshGitHub(requestID: UUID, forceProjectDiscovery: Bool) async {
+        let source = CISource.github
+        let cachedProjects = accessibleCIProjects.filter { source.contains(projectID: $0.id) }
+        var projects = cachedProjects
+        var pipelines = pipelineCache.filter { source.contains(projectID: $0.key) }
+        var errors: [String] = []
+        var connectionFailed = false
+        var didGitHubRepositorySync = false
+        var didGitHubFullDiscovery = false
+        let startedAt = Date()
+        let profiler = CIRefreshProfiler()
+        defer {
+            finishCIRefresh(source: source, requestID: requestID, connectionFailed: connectionFailed, errors: errors, profiler: profiler)
+        }
+        if let token = await self.githubAccessTokenForRequest(), !token.isEmpty {
+            let cachedGitHubProjects = cachedProjects.filter { $0.provider == "GitHub Actions" && $0.isInRepositoryScope }
+            var githubProjects = cachedGitHubProjects
+            do {
+                let client = GitHubAPIClient(token: token, session: ciSession)
+                // GitHub's repository list supports `since`, so only
+                // repositories changed since the previous sync need an
+                // Actions-runs request. Keep the first sync and an
+                // explicit force refresh bounded to the recent scope.
+                let fullDiscovery = forceProjectDiscovery || lastGitHubRepositorySync == nil || cachedGitHubProjects.isEmpty ||
+                    lastGitHubFullDiscovery.map { Date().timeIntervalSince($0) > Self.githubFullDiscoveryInterval } ?? true
+                let discovered = try await profiler.measure("GitHub · 仓库索引", requests: 1) {
+                    try await client.ownedProjects(
+                        limit: fullDiscovery ? Self.githubRepositoryLimit : 100,
+                        since: fullDiscovery ? nil : self.lastGitHubRepositorySync?.addingTimeInterval(-60)
+                    )
+                }
+                let changed = discovered.map {
+                    CIAccessibleProject(
+                        id: $0.id, name: $0.name, provider: $0.provider,
+                        repository: $0.repository, branch: $0.branch,
+                        instanceName: nil, updatedAt: $0.updatedAt,
+                        isOwnedByCurrentUser: true
+                    )
+                }
+                if fullDiscovery {
+                    githubProjects = Array(changed.prefix(Self.githubRepositoryLimit))
+                } else {
+                    githubProjects = CIActivityOrdering.mergedRecentProjects(
+                        changed: changed,
+                        cached: cachedGitHubProjects,
+                        limit: Self.githubRepositoryLimit
+                    )
+                }
+                projects = githubProjects
+
+                let projectsToRefresh: [CIAccessibleProject]
+                if fullDiscovery {
+                    projectsToRefresh = githubProjects
+                } else {
+                    projectsToRefresh = CIActivityOrdering.projectsRequiringPipelineRefresh(
+                        changed: changed,
+                        retained: githubProjects
+                    )
+                }
+                // Requests within this account stay serial; other accounts
+                // refresh in their own main-actor tasks.
+                var didFetchAllChangedPipelines = true
+                for project in projectsToRefresh {
+                    try Task.checkCancellation()
+                    let parts = project.repository.split(separator: "/", maxSplits: 1).map(String.init)
+                    guard parts.count == 2 else { continue }
+                    do {
+                        let remote = try await profiler.measure("GitHub · 流水线", requests: 1) {
+                            try await client.recentRuns(owner: parts[0], repository: parts[1], projectID: project.id)
+                        }
+                        let refreshed = remote.map(self.makePipeline)
+                        let previous = pipelines[project.id] ?? []
+                        pipelines[project.id] = refreshed.map { pipeline in
+                            CIPipelineCache.merging(pipeline, with: previous.first { $0.id == pipeline.id })
+                        }
+                        publishCIResult(source: source, requestID: requestID, projects: githubProjects, pipelines: pipelines)
+                    } catch {
+                        // Do not advance the repository cursor: this
+                        // change must be retried on the next refresh.
+                        didFetchAllChangedPipelines = false
+                        if CIConnectionFailure.shouldStopRequests(error) { throw error }
+                        errors.append("GitHub \(project.repository)：\(error.localizedDescription)")
+                    }
+                }
+                didGitHubRepositorySync = didFetchAllChangedPipelines
+                didGitHubFullDiscovery = fullDiscovery && didFetchAllChangedPipelines
+            } catch {
+                connectionFailed = CIConnectionFailure.isOffline(error)
+                errors.append("GitHub：\(error.localizedDescription)")
+                return
+            }
+            projects = githubProjects
+        }
+
+        guard ciRefreshScheduler.isCurrent(source, requestID: requestID), !Task.isCancelled else { return }
+        if didGitHubRepositorySync { lastGitHubRepositorySync = startedAt }
+        if didGitHubFullDiscovery { lastGitHubFullDiscovery = startedAt }
+        if !projects.isEmpty || didGitHubRepositorySync {
+            publishCIResult(source: source, requestID: requestID, projects: projects, pipelines: pipelines)
+        }
+    }
+
+    private func refreshGitLab(_ instance: GitLabInstance, requestID: UUID, forceProjectDiscovery: Bool) async {
+        let source = CISource.gitlab(instance.id)
+        let cachedProjects = accessibleCIProjects.filter { source.contains(projectID: $0.id) }
+        var projects: [CIAccessibleProject] = []
+        var pipelines = pipelineCache.filter { source.contains(projectID: $0.key) }
+        var errors: [String] = []
+        var connectionFailed = false
+        var didDiscover = false
+        let profiler = CIRefreshProfiler()
+        defer {
+            finishCIRefresh(source: source, requestID: requestID, connectionFailed: connectionFailed, errors: errors, profiler: profiler)
+        }
+        guard let token = self.gitLabToken(for: instance) else { return }
+        do {
+            let client = try GitLabAPIClient(instanceURL: instance.host, token: token, session: ciSession, projectIDPrefix: instance.id.uuidString)
+            let syncKey = instance.id.uuidString
+            var globalCapability = self.gitLabGlobalPipelineCapabilities[syncKey]
+            var projectSyncDates = self.gitLabProjectPipelineSyncDates.filter { $0.key.hasPrefix("\(syncKey):") }
+            let syncStartedAt = Date()
+            let instanceProjectPrefix = "gitlab:\(syncKey):"
+            var gitLabProjects = cachedProjects
+            var advancesPipelineCursor = false
+            var remotePipelines: [RemotePipeline] = []
+
+            if globalCapability != false {
+                do {
+                    // GitLab has a cross-project pipeline feed, so the
+                    // normal path starts here rather than enumerating
+                    // `/projects`. Its cursor is creation-based; a
+                    // short overlap handles requests at the boundary.
+                    let cursor = forceProjectDiscovery ? nil : self.gitLabPipelineSyncDates[syncKey]
+                    let createdAfter = cursor?.addingTimeInterval(-Self.gitLabPipelineSyncOverlap)
+                    remotePipelines = try await profiler.measure("\(instance.name) · 全局流水线", requests: 1) {
+                        try await client.recentPipelines(limit: 100, createdAfter: createdAfter)
+                    }
+                    advancesPipelineCursor = true
+                    globalCapability = true
+
+                    // The global cursor only returns newly created
+                    // pipelines. Refresh cached running ones directly
+                    // so their final result still reaches the card.
+                    let runningCached = pipelines.values
+                        .flatMap { $0 }
+                        .filter { $0.provider == "GitLab CI" && $0.projectID.hasPrefix(instanceProjectPrefix) && $0.state == .running }
+                    for pipeline in runningCached {
+                        let pipelineID = pipeline.id.split(separator: "-").last.map(String.init) ?? pipeline.id
+                        let refreshed = try await optionalCIRequest {
+                            try await profiler.measure("\(instance.name) · 运行中流水线", requests: 1) {
+                                try await client.pipeline(projectID: pipeline.projectID, pipelineID: pipelineID)
+                            }
+                        }
+                        if let refreshed {
+                            remotePipelines.append(refreshed)
+                        }
+                    }
+                } catch let CIIntegrationError.http(code, _) where code == 404 || code == 405 {
+                    // The authenticated probe confirms that this
+                    // instance is older than the cross-project API.
+                    // Persist it so later polls do not repeat 404.
+                    globalCapability = false
+                } catch {
+                    throw error
+                }
+            }
+
+            guard ciRefreshScheduler.isCurrent(source, requestID: requestID), !Task.isCancelled else { return }
+            self.gitLabGlobalPipelineCapabilities[syncKey] = globalCapability
+
+            if globalCapability == false {
+                // Old GitLab has no instance-wide activity feed.
+                // Reuse its persisted project index; only a first
+                // sync or an explicit discovery refresh enumerates
+                // `/projects` again.
+                if forceProjectDiscovery || gitLabProjects.isEmpty {
+                    let discovered = try await profiler.measure("\(instance.name) · 项目索引（兼容）", requests: 1) {
+                        try await client.accessibleProjects()
+                    }
+                    gitLabProjects = discovered.map {
+                        CIAccessibleProject(
+                            id: $0.id, name: $0.name, provider: $0.provider,
+                            repository: $0.repository, branch: $0.branch,
+                            instanceName: instance.name
+                        )
+                    }
+                    didDiscover = true
+                }
+                let fallbackProjects = Array(gitLabProjects.prefix(GitLabAPIClient.legacyFallbackProjectLimit))
+                for project in fallbackProjects {
+                    try Task.checkCancellation()
+                    let projectSyncKey = "\(syncKey):\(project.id)"
+                    let cachedCursor = pipelines[project.id]?.compactMap(\.updatedAt).max()
+                    let cursor = forceProjectDiscovery ? nil : (projectSyncDates[projectSyncKey] ?? cachedCursor)
+                    let syncStartedAt = Date()
+                    do {
+                        let projectPipelines = try await profiler.measure("\(instance.name) · 项目流水线（兼容）", requests: 1) {
+                            try await client.recentPipelines(
+                                projectID: project.id,
+                                limit: cursor == nil ? 5 : 100,
+                                updatedAfter: cursor
+                            )
+                        }
+                        remotePipelines.append(contentsOf: projectPipelines)
+                        // Advance only after a successful response;
+                        // a failed request remains eligible next time.
+                        projectSyncDates[projectSyncKey] = syncStartedAt
+                    } catch {
+                        if CIConnectionFailure.shouldStopRequests(error) { throw error }
+                        errors.append("\(instance.name) \(project.repository)：\(error.localizedDescription)")
+                    }
+                }
+            }
+
+            // A global response can contain the same running
+            // pipeline as the direct refresh above. Let the direct
+            // response win and never duplicate the card.
+            var remotesByID: [String: RemotePipeline] = [:]
+            for remote in remotePipelines {
+                remotesByID["\(remote.projectID):\(remote.id)"] = remote
+            }
+            remotePipelines = Array(remotesByID.values)
+
+            // New GitLab versions include `project` metadata in
+            // the global feed. For older responses, resolve only
+            // those individual unseen project IDs, never the full
+            // project list.
+            var projectsByID = Dictionary(uniqueKeysWithValues: gitLabProjects.map { ($0.id, $0) })
+            var resolvedAllProjects = true
+            for remote in remotePipelines where projectsByID[remote.projectID] == nil {
+                if let project = self.makeGitLabProject(remote, instance: instance) {
+                    projectsByID[project.id] = project
+                } else {
+                    do {
+                        let resolved = try await profiler.measure("\(instance.name) · 项目元数据", requests: 1) {
+                            try await client.project(projectID: remote.projectID)
+                        }
+                        projectsByID[remote.projectID] = CIAccessibleProject(
+                            id: remote.projectID, name: resolved.name, provider: resolved.provider,
+                            repository: resolved.repository, branch: resolved.branch,
+                            instanceName: instance.name
+                        )
+                    } catch {
+                        resolvedAllProjects = false
+                        if CIConnectionFailure.shouldStopRequests(error) { throw error }
+                        errors.append("\(instance.name)：\(error.localizedDescription)")
+                    }
+                }
+            }
+
+            var orderedProjectIDs: [String] = []
+            for remote in remotePipelines where projectsByID[remote.projectID] != nil {
+                if !orderedProjectIDs.contains(remote.projectID) { orderedProjectIDs.append(remote.projectID) }
+            }
+            for project in gitLabProjects where projectsByID[project.id] != nil {
+                if !orderedProjectIDs.contains(project.id) { orderedProjectIDs.append(project.id) }
+            }
+            gitLabProjects = orderedProjectIDs.compactMap { projectsByID[$0] }
+            projects = gitLabProjects
+
+            let cacheMergeStartedAt = Date()
+            let grouped = Dictionary(grouping: remotePipelines, by: \.projectID)
+            for (projectID, remotes) in grouped {
+                guard let project = projectsByID[projectID] else { continue }
+                let refreshed = remotes.map { self.makePipeline($0, project: project) }
+                pipelines[projectID] = CIPipelineCache.mergingRecent(
+                    refreshed, with: pipelines[projectID] ?? []
+                )
+            }
+            profiler.record("本地索引与缓存合并", duration: Date().timeIntervalSince(cacheMergeStartedAt))
+            publishCIResult(source: source, requestID: requestID, projects: projects, pipelines: pipelines)
+
+            // GitLab's list endpoint omits duration and start time
+            // on older instances. Fill those fields only for the
+            // current completed pipeline of a followed project,
+            // then retain the detail in the local cache. This is
+            // at most one extra request per affected card, not a
+            // history-wide re-query on every refresh.
+            let followedProjectIDs = Set(self.ciProjects.compactMap { project in
+                source.contains(projectID: project.id) ? project.id : nil
+            })
+            for projectID in followedProjectIDs {
+                guard let project = projectsByID[projectID],
+                      let latest = pipelines[projectID]?.sorted(by: CIActivityOrdering.newestFirst).first,
+                      latest.duration == "—",
+                      latest.state != .running else { continue }
+                let pipelineID = latest.id.split(separator: "-").last.map(String.init) ?? latest.id
+                let detailed = try await optionalCIRequest {
+                    try await profiler.measure("\(instance.name) · 关注流水线详情（耗时）", requests: 1) {
+                        try await client.pipeline(projectID: projectID, pipelineID: pipelineID)
+                    }
+                }
+                guard let detailed else { continue }
+                let refreshed = self.makePipeline(detailed, project: project)
+                pipelines[projectID] = CIPipelineCache.mergingRecent(
+                    [refreshed], with: pipelines[projectID] ?? []
+                )
+            }
+
+            // Re-fetch jobs only for a newly seen pipeline or one
+            // still in flight. Completed, already-loaded jobs stay
+            // in the local cache and add no request to this cycle.
+            var stageCandidates: [(String, Pipeline)] = []
+            var stageCandidateIDs = Set<String>()
+            for remote in remotePipelines {
+                guard let pipeline = pipelines[remote.projectID]?.first(where: { $0.id == remote.id }),
+                      pipeline.state == .running || !pipeline.hasLoadedStages else { continue }
+                let key = "\(remote.projectID):\(pipeline.id)"
+                if stageCandidateIDs.insert(key).inserted {
+                    stageCandidates.append((remote.projectID, pipeline))
+                }
+            }
+            let stageUpdates = try await prefetchPipelineStages(
+                candidates: stageCandidates,
+                limit: Self.stagePrefetchProjectLimit
+            ) { pipeline in
+                let pipelineID = pipeline.id.split(separator: "-").last.map(String.init) ?? pipeline.id
+                return try await optionalCIRequest {
+                    try await profiler.measure("\(instance.name) · 作业步骤", requests: 1) {
+                        try await client.jobs(projectID: pipeline.projectID, pipelineID: pipelineID)
+                    }
+                } ?? []
+            }
+            for (projectID, staged) in stageUpdates {
+                pipelines[projectID] = CIPipelineCache.mergingRecent(
+                    [staged], with: pipelines[projectID] ?? []
+                )
+            }
+            guard ciRefreshScheduler.isCurrent(source, requestID: requestID), !Task.isCancelled else { return }
+            self.gitLabGlobalPipelineCapabilities[syncKey] = globalCapability
+            self.gitLabProjectPipelineSyncDates.merge(projectSyncDates) { _, refreshed in refreshed }
+            if advancesPipelineCursor && resolvedAllProjects {
+                self.gitLabPipelineSyncDates[syncKey] = syncStartedAt
+            }
+        } catch {
+            // Keep the live cache, including any summaries already published
+            // before an optional detail request lost its connection.
+            connectionFailed = CIConnectionFailure.isOffline(error)
+            errors.append("\(instance.name)：\(error.localizedDescription)")
+            return
+        }
+
+        guard ciRefreshScheduler.isCurrent(source, requestID: requestID), !Task.isCancelled else { return }
+        publishCIResult(source: source, requestID: requestID, projects: projects, pipelines: pipelines)
+        if didDiscover {
+            lastCIProjectDiscovery = Date()
+            defaults.set(Self.projectIndexOrderVersion, forKey: Self.projectIndexOrderVersionKey)
+        }
     }
 
     /// GitLab's collection endpoint intentionally omits execution timing on
@@ -1320,6 +1413,7 @@ final class StackHubStore: ObservableObject {
               let instance = instances.first(where: {
                   pipeline.projectID.hasPrefix("gitlab:\($0.id.uuidString):")
               }),
+              !offlineCISources.contains(.gitlab(instance.id)),
               hydratingGitLabPipelineTimingIDs.insert(hydrationID).inserted else {
             return
         }
@@ -1346,6 +1440,7 @@ final class StackHubStore: ObservableObject {
     }
 
     private func githubAccessTokenForRequest() async -> String? {
+        if let ciCredentialProvider { return await ciCredentialProvider.github() }
         var bundle = loadCredentialBundle()
         let storedToken: String?
         if let cached = githubAccessTokenCache, !cached.isEmpty {
@@ -1389,8 +1484,9 @@ final class StackHubStore: ObservableObject {
         githubRefreshTokenCache = refreshToken
         do {
             let clientID = UserDefaults.standard.string(forKey: GitHubOAuthConfiguration.clientIDKey) ?? GitHubOAuthConfiguration.defaultClientID
-            let credential = try await GitHubOAuthClient(session: .shared).refreshAccessToken(clientID: clientID, refreshToken: refreshToken)
-            saveGitHubCredential(credential)
+            let credential = try await GitHubOAuthClient(session: ciSession).refreshAccessToken(clientID: clientID, refreshToken: refreshToken)
+            guard !Task.isCancelled else { return nil }
+            saveGitHubCredential(credential, resetProjectIndex: false)
             return credential.accessToken
         } catch {
             // Keep the existing token for one last attempt; the API error will
@@ -1400,6 +1496,7 @@ final class StackHubStore: ObservableObject {
     }
 
     private func gitLabToken(for instance: GitLabInstance) -> String? {
+        if let ciCredentialProvider { return ciCredentialProvider.gitlab(instance) }
         if let cached = gitLabTokenCache[instance.host], !cached.isEmpty { return cached }
         var bundle = loadCredentialBundle()
         if let bundled = bundle.gitLabTokens[instance.host], !bundled.isEmpty {
@@ -1938,6 +2035,7 @@ final class StackHubStore: ObservableObject {
         } else if !hasTokenAfterSave {
             gitLabCredentialHosts.remove(resolvedHost)
         }
+        invalidateCIRefresh(.gitlab(instance.id))
         instances[index] = GitLabInstance(id: instance.id, name: resolvedName, host: resolvedHost, project: project.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? instance.project : project, isConnected: hasTokenAfterSave)
         persistCIState()
         toast = "已保存 GitLab 实例"
@@ -1971,8 +2069,10 @@ final class StackHubStore: ObservableObject {
         gitLabTokenCache.removeValue(forKey: instance.host)
         clearGitLabRefreshState(for: instance.id)
         instances.removeAll { $0.id == instance.id }
-        accessibleCIProjects.removeAll { $0.instanceName == instance.name }
-        ciProjects.removeAll { $0.instanceName == instance.name }
+        let source = CISource.gitlab(instance.id)
+        accessibleCIProjects.removeAll { source.contains(projectID: $0.id) }
+        ciProjects.removeAll { source.contains(projectID: $0.id) }
+        pipelineCache = pipelineCache.filter { !source.contains(projectID: $0.key) }
         persistCIState()
     }
 }
@@ -2739,13 +2839,13 @@ private struct CIRefreshStatusButton: View {
             }
         }
         .buttonStyle(.plain)
-        .disabled(store.isRefreshingCI)
-        .help(L(store.isRefreshingCI ? "正在刷新 CI" : "点击立即刷新 CI"))
+        .help(store.ciError ?? L("点击立即刷新 CI"))
         .accessibilityLabel(L("立即刷新 CI"))
     }
 
     private func updateAge(at date: Date) -> String {
         if store.isRefreshingCI { return L("刷新中") }
+        if store.ciError != nil { return L("部分连接失败") }
         guard let lastRefresh = store.lastCIRefresh else { return L("尚未更新") }
         let elapsedSeconds = max(0, Int(date.timeIntervalSince(lastRefresh)))
         if elapsedSeconds < 60 { return LF("%ld 秒前", elapsedSeconds) }

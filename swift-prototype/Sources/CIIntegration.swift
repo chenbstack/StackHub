@@ -178,7 +178,7 @@ final class GitHubAPIClient {
     private let session: URLSession
     private let decoder: JSONDecoder
 
-    init(token: String, session: URLSession = .shared) {
+    init(token: String, session: URLSession = CIHTTPTransport.session) {
         self.token = token
         self.session = session
         self.decoder = JSONDecoder()
@@ -236,7 +236,7 @@ final class GitHubAPIClient {
 
     func jobLog(owner: String, repository: String, jobID: String) async throws -> String {
         let url = try makeURL(path: "/repos/\(owner)/\(repository)/actions/jobs/\(jobID)/logs")
-        var request = URLRequest(url: url, timeoutInterval: 10)
+        var request = URLRequest(url: url, timeoutInterval: CIHTTPTransport.timeout)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         let (data, response) = try await session.data(for: request)
@@ -286,7 +286,7 @@ final class GitHubAPIClient {
     }
 
     private func send<T: Decodable>(_ url: URL) async throws -> T {
-        var request = URLRequest(url: url, timeoutInterval: 10)
+        var request = URLRequest(url: url, timeoutInterval: CIHTTPTransport.timeout)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
@@ -369,7 +369,7 @@ final class GitLabAPIClient {
         return formatter
     }()
 
-    init(instanceURL: String, token: String, session: URLSession = .shared, projectIDPrefix: String? = nil) throws {
+    init(instanceURL: String, token: String, session: URLSession = CIHTTPTransport.session, projectIDPrefix: String? = nil) throws {
         var normalized = instanceURL.trimmingCharacters(in: .whitespacesAndNewlines)
         if !normalized.contains("://") { normalized = "https://\(normalized)" }
         if normalized.hasSuffix("/") { normalized = String(normalized.dropLast()) }
@@ -487,7 +487,7 @@ final class GitLabAPIClient {
 
     func jobLog(projectID: String, jobID: String) async throws -> String {
         let url = try makeURL(path: "/api/v4/projects/\(apiProjectID(projectID))/jobs/\(jobID)/trace")
-        var request = URLRequest(url: url, timeoutInterval: 10)
+        var request = URLRequest(url: url, timeoutInterval: CIHTTPTransport.timeout)
         request.setValue(token, forHTTPHeaderField: "PRIVATE-TOKEN")
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw CIIntegrationError.http(-1, "无效响应") }
@@ -527,7 +527,7 @@ final class GitLabAPIClient {
     }
 
     private func send<T: Decodable>(_ url: URL) async throws -> T {
-        var request = URLRequest(url: url, timeoutInterval: 10)
+        var request = URLRequest(url: url, timeoutInterval: CIHTTPTransport.timeout)
         request.setValue(token, forHTTPHeaderField: "PRIVATE-TOKEN")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         let (data, response) = try await session.data(for: request)

@@ -18,7 +18,7 @@ struct CIRefreshReport: Identifiable {
     let components: [CIRefreshTimingComponent]
 }
 
-/// Aggregates timings inside one serial CI refresh. It deliberately records
+/// Aggregates timings inside one source's CI refresh. It deliberately records
 /// provider requests separately from local cache work so slow refreshes can be
 /// traced to a concrete API or processing step in the panel's refresh log.
 final class CIRefreshProfiler {

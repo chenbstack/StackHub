@@ -263,3 +263,5 @@
 "此版本无法自动安装，请查看 GitHub Release。" = "This version cannot be installed automatically. See GitHub Releases.";
 "更新失败" = "Update failed";
 "好" = "OK";
+
+"部分连接失败" = "Some connections failed";
