@@ -1,0 +1,6 @@
+.DS_Store
+
+# SwiftPM and locally packaged application artifacts
+swift-prototype/.build/
+swift-prototype/.swiftpm/
+swift-prototype/dist/
