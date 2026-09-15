@@ -512,6 +512,9 @@ struct Pipeline: Identifiable, Codable {
     /// Summary cards start with a single placeholder stage. This flag keeps
     /// that placeholder distinct from real job/stage data.
     let hasLoadedStages: Bool
+    /// Overall state when the cached jobs were fetched. Optional for caches
+    /// saved by older versions; loaded jobs still need a final completion sync.
+    let stageSnapshotState: PipelineState?
 
     init(
         id: String,
@@ -526,7 +529,8 @@ struct Pipeline: Identifiable, Codable {
         updatedAt: Date?,
         webURL: String?,
         startedAt: Date? = nil,
-        hasLoadedStages: Bool = false
+        hasLoadedStages: Bool = false,
+        stageSnapshotState: PipelineState? = nil
     ) {
         self.id = id
         self.projectID = projectID
@@ -541,6 +545,7 @@ struct Pipeline: Identifiable, Codable {
         self.startedAt = startedAt
         self.webURL = webURL
         self.hasLoadedStages = hasLoadedStages
+        self.stageSnapshotState = stageSnapshotState
     }
 }
 
@@ -1108,6 +1113,37 @@ final class StackHubStore: ObservableObject {
                 }
                 didGitHubRepositorySync = didFetchAllChangedPipelines
                 didGitHubFullDiscovery = fullDiscovery && didFetchAllChangedPipelines
+                if didGitHubRepositorySync { lastGitHubRepositorySync = startedAt }
+                if didGitHubFullDiscovery { lastGitHubFullDiscovery = startedAt }
+
+                // Publish every repository's summary before optional jobs.
+                // Completed runs with no local details must load without a click.
+                let retainedIDs = Set(githubProjects.map(\.id))
+                let stageCandidates = CIPipelineCache.stageRefreshCandidates(
+                    in: pipelines.filter { retainedIDs.contains($0.key) }
+                )
+                _ = try await prefetchPipelineStages(
+                    candidates: stageCandidates,
+                    limit: Self.stagePrefetchProjectLimit,
+                    onLoad: { projectID, staged in
+                        guard self.ciRefreshScheduler.isCurrent(source, requestID: requestID), !Task.isCancelled else { return }
+                        pipelines[projectID] = CIPipelineCache.mergingRecent([staged], with: pipelines[projectID] ?? [])
+                        self.publishCIResult(source: source, requestID: requestID, projects: githubProjects, pipelines: pipelines)
+                    }
+                ) { pipeline in
+                    let parts = pipeline.repository.split(separator: "/", maxSplits: 1).map(String.init)
+                    guard parts.count == 2 else { return [] }
+                    let runID = pipeline.id.split(separator: "-").last.map(String.init) ?? pipeline.id
+                    do {
+                        return try await profiler.measure("GitHub · 作业步骤", requests: 1) {
+                            try await client.jobs(owner: parts[0], repository: parts[1], runID: runID)
+                        }
+                    } catch {
+                        if CIConnectionFailure.shouldStopRequests(error) { throw error }
+                        errors.append("GitHub \(pipeline.repository) · 作业步骤：\(error.localizedDescription)")
+                        return []
+                    }
+                }
             } catch {
                 connectionFailed = CIConnectionFailure.isOffline(error)
                 errors.append("GitHub：\(error.localizedDescription)")
@@ -1117,8 +1153,6 @@ final class StackHubStore: ObservableObject {
         }
 
         guard ciRefreshScheduler.isCurrent(source, requestID: requestID), !Task.isCancelled else { return }
-        if didGitHubRepositorySync { lastGitHubRepositorySync = startedAt }
-        if didGitHubFullDiscovery { lastGitHubFullDiscovery = startedAt }
         if !projects.isEmpty || didGitHubRepositorySync {
             publishCIResult(source: source, requestID: requestID, projects: projects, pipelines: pipelines)
         }
@@ -1321,22 +1355,18 @@ final class StackHubStore: ObservableObject {
                 )
             }
 
-            // Re-fetch jobs only for a newly seen pipeline or one
-            // still in flight. Completed, already-loaded jobs stay
-            // in the local cache and add no request to this cycle.
-            var stageCandidates: [(String, Pipeline)] = []
-            var stageCandidateIDs = Set<String>()
-            for remote in remotePipelines {
-                guard let pipeline = pipelines[remote.projectID]?.first(where: { $0.id == remote.id }),
-                      pipeline.state == .running || !pipeline.hasLoadedStages else { continue }
-                let key = "\(remote.projectID):\(pipeline.id)"
-                if stageCandidateIDs.insert(key).inserted {
-                    stageCandidates.append((remote.projectID, pipeline))
-                }
-            }
-            let stageUpdates = try await prefetchPipelineStages(
+            // Retry missing cached details even after the global feed cursor
+            // has advanced past a completed run. Keep each successful result
+            // immediately if a later job request loses its connection.
+            let stageCandidates = CIPipelineCache.stageRefreshCandidates(in: pipelines)
+            _ = try await prefetchPipelineStages(
                 candidates: stageCandidates,
-                limit: Self.stagePrefetchProjectLimit
+                limit: Self.stagePrefetchProjectLimit,
+                onLoad: { projectID, staged in
+                    guard self.ciRefreshScheduler.isCurrent(source, requestID: requestID), !Task.isCancelled else { return }
+                    pipelines[projectID] = CIPipelineCache.mergingRecent([staged], with: pipelines[projectID] ?? [])
+                    self.publishCIResult(source: source, requestID: requestID, projects: projects, pipelines: pipelines)
+                }
             ) { pipeline in
                 let pipelineID = pipeline.id.split(separator: "-").last.map(String.init) ?? pipeline.id
                 return try await optionalCIRequest {
@@ -1344,11 +1374,6 @@ final class StackHubStore: ObservableObject {
                         try await client.jobs(projectID: pipeline.projectID, pipelineID: pipelineID)
                     }
                 } ?? []
-            }
-            for (projectID, staged) in stageUpdates {
-                pipelines[projectID] = CIPipelineCache.mergingRecent(
-                    [staged], with: pipelines[projectID] ?? []
-                )
             }
             guard ciRefreshScheduler.isCurrent(source, requestID: requestID), !Task.isCancelled else { return }
             self.gitLabGlobalPipelineCapabilities[syncKey] = globalCapability
@@ -1626,7 +1651,8 @@ final class StackHubStore: ObservableObject {
                         updatedAt: current.updatedAt,
                         webURL: current.webURL,
                         startedAt: current.startedAt,
-                        hasLoadedStages: current.hasLoadedStages
+                        hasLoadedStages: current.hasLoadedStages,
+                        stageSnapshotState: current.stageSnapshotState
                     )
                 }
                 self.pipelineCache[pipeline.projectID] = self.pipelineCache[pipeline.projectID]?.map { current in

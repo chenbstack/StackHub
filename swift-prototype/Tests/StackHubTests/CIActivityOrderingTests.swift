@@ -185,6 +185,56 @@ final class CIActivityOrderingTests: XCTestCase {
         XCTAssertEqual(merged.commit, refreshed.commit)
     }
 
+    func testLegacyStageCacheKeepsLogsAndRequiresFinalRefreshAfterCompletion() throws {
+        let repository = project("github:owner/example")
+        let running = Pipeline(
+            id: "github-1", projectID: repository.id, provider: repository.provider, repository: repository.repository,
+            branch: "main", commit: "old", duration: "2 sec", state: .running,
+            stages: [PipelineStage(id: "job-1", name: "Build", duration: "1 sec", state: .success, log: "cached log")],
+            updatedAt: Date(timeIntervalSince1970: 100), webURL: nil, hasLoadedStages: true
+        )
+        var legacyJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(running)) as? [String: Any])
+        legacyJSON.removeValue(forKey: "stageSnapshotState")
+        let legacy = try JSONDecoder().decode(Pipeline.self, from: JSONSerialization.data(withJSONObject: legacyJSON))
+        let completed = pipeline("github-1", project: repository, timestamp: 200)
+        let merged = CIPipelineCache.merging(completed, with: legacy)
+        XCTAssertTrue(merged.hasLoadedStages)
+        XCTAssertEqual(merged.stages.first?.log, "cached log")
+        XCTAssertEqual(merged.stageSnapshotState, .running)
+
+        // A restart after a failed final jobs fetch must retain retry eligibility.
+        let restored = try JSONDecoder().decode(Pipeline.self, from: JSONEncoder().encode(merged))
+        XCTAssertEqual(CIPipelineCache.stageRefreshCandidates(in: [repository.id: [restored]]).count, 1)
+        let jobs = [RemoteJob(id: "job-1", name: "Build", stage: "Build", status: "success", duration: "1 sec", log: "")]
+        let staged = try XCTUnwrap(CIPipelineCache.withJobs(restored, jobs: jobs))
+        let final = CIPipelineCache.merging(staged, with: restored)
+        XCTAssertEqual(final.stages.first?.log, "cached log")
+        XCTAssertEqual(final.stageSnapshotState, .success)
+        XCTAssertTrue(CIPipelineCache.stageRefreshCandidates(in: [repository.id: [final]]).isEmpty)
+    }
+
+    @MainActor
+    func testPrefetchPublishesEachSuccessBeforeALaterRequestFails() async throws {
+        let first = project("github:owner/first")
+        let second = project("github:owner/second")
+        let candidates = [(first.id, pipeline("github-1", project: first, timestamp: 200)),
+                          (second.id, pipeline("github-2", project: second, timestamp: 100))]
+        var published: [String: Pipeline] = [:]
+        do {
+            _ = try await prefetchPipelineStages(candidates: candidates, limit: 8, onLoad: { projectID, loaded in
+                published[projectID] = loaded
+            }) { pipeline in
+                if pipeline.projectID == second.id { throw URLError(.timedOut) }
+                return [RemoteJob(id: "job-1", name: "Build", stage: "Build", status: "success", duration: "1 sec", log: "")]
+            }
+            XCTFail("Expected the second jobs request to fail")
+        } catch {
+            XCTAssertEqual((error as? URLError)?.code, .timedOut)
+        }
+        XCTAssertEqual(published.count, 1)
+        XCTAssertEqual(published[first.id]?.hasLoadedStages, true)
+    }
+
     func testIncrementalPipelineMergePreservesUnchangedPipelines() {
         let repository = project("gitlab:one:1", provider: "GitLab CI")
         let unchanged = pipeline("gitlab-older", project: repository, timestamp: 100)

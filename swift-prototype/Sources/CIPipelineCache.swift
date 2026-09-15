@@ -1,6 +1,18 @@
 import Foundation
 
 enum CIPipelineCache {
+    /// Dashboard cards show the newest run for each project. Missing details
+    /// remain eligible even when an incremental response omits that run.
+    static func stageRefreshCandidates(in cache: [String: [Pipeline]]) -> [(String, Pipeline)] {
+        cache.compactMap { projectID, runs in
+            guard let latest = runs.sorted(by: CIActivityOrdering.newestFirst).first,
+                  !latest.hasLoadedStages || latest.state == .running ||
+                    latest.stageSnapshotState.map({ $0 != latest.state }) == true ||
+                    latest.stages.contains(where: { $0.state == .running }) else { return nil }
+            return (projectID, latest)
+        }
+    }
+
     /// Incremental providers return only the pipelines that changed since the
     /// last cursor. Merge those summaries into the local recent list instead
     /// of replacing unchanged pipelines from other projects or earlier pages.
@@ -24,7 +36,8 @@ enum CIPipelineCache {
         guard let previous, previous.hasLoadedStages else { return refreshed }
 
         if !refreshed.hasLoadedStages {
-            return copy(refreshed, stages: previous.stages, hasLoadedStages: true)
+            return copy(refreshed, stages: previous.stages, hasLoadedStages: true,
+                        stageSnapshotState: previous.stageSnapshotState ?? previous.state)
         }
 
         let previousByID = Dictionary(uniqueKeysWithValues: previous.stages.map { ($0.id, $0) })
@@ -39,7 +52,8 @@ enum CIPipelineCache {
                 group: stage.group
             )
         }
-        return copy(refreshed, stages: stages, hasLoadedStages: true)
+        return copy(refreshed, stages: stages, hasLoadedStages: true,
+                    stageSnapshotState: refreshed.stageSnapshotState ?? refreshed.state)
     }
 
     static func withJobs(_ pipeline: Pipeline, jobs: [RemoteJob]) -> Pipeline? {
@@ -54,10 +68,11 @@ enum CIPipelineCache {
                 group: job.stage.isEmpty ? nil : job.stage
             )
         }
-        return copy(pipeline, stages: stages, hasLoadedStages: true)
+        return copy(pipeline, stages: stages, hasLoadedStages: true, stageSnapshotState: pipeline.state)
     }
 
-    private static func copy(_ pipeline: Pipeline, stages: [PipelineStage], hasLoadedStages: Bool) -> Pipeline {
+    private static func copy(_ pipeline: Pipeline, stages: [PipelineStage], hasLoadedStages: Bool,
+                             stageSnapshotState: PipelineState) -> Pipeline {
         Pipeline(
             id: pipeline.id,
             projectID: pipeline.projectID,
@@ -71,16 +86,19 @@ enum CIPipelineCache {
             updatedAt: pipeline.updatedAt,
             webURL: pipeline.webURL,
             startedAt: pipeline.startedAt,
-            hasLoadedStages: hasLoadedStages
+            hasLoadedStages: hasLoadedStages,
+            stageSnapshotState: stageSnapshotState
         )
     }
 }
 
 /// Prefetch stage statuses for a small, time-ordered set of projects. Logs
 /// remain lazy and are fetched only when the user opens a pipeline.
+@MainActor
 func prefetchPipelineStages(
     candidates: [(String, Pipeline)],
     limit: Int,
+    onLoad: (String, Pipeline) -> Void = { _, _ in },
     fetchJobs: @escaping (Pipeline) async throws -> [RemoteJob]
 ) async rethrows -> [String: Pipeline] {
     let selected = Array(candidates
@@ -93,6 +111,7 @@ func prefetchPipelineStages(
         let jobs = try await fetchJobs(pipeline)
         if let staged = CIPipelineCache.withJobs(pipeline, jobs: jobs) {
             result[projectID] = staged
+            onLoad(projectID, staged)
         }
     }
     return result

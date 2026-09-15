@@ -154,6 +154,7 @@ final class CIRefreshIsolationTests: XCTestCase {
         defer { fixture.cleanUp() }
         fixture.router.respond { request in
             if request.url!.path == "/user/repos" { return .json(self.githubRepositoryJSON) }
+            if request.url!.path.hasSuffix("/jobs") { return .json("{\"jobs\":[]}") }
             return .json(self.githubRunsJSON(status: "in_progress", conclusion: nil))
         }
         fixture.store.refreshCI()
@@ -171,9 +172,12 @@ final class CIRefreshIsolationTests: XCTestCase {
             }
         }
         fixture.store.openPipeline(running)
-        try await eventually { fixture.router.requests.contains { $0.url!.path.hasSuffix("/jobs") } }
+        try await eventually { fixture.router.requests.filter { $0.url!.path.hasSuffix("/jobs") }.count == 2 }
         fixture.store.refreshCI()
-        try await eventually { !fixture.store.isRefreshingCI }
+        try await eventually {
+            fixture.store.pipelineCache[projectID]?.first?.state == .success &&
+            fixture.router.requests.filter { $0.url!.path.hasSuffix("/jobs") }.count == 3
+        }
         XCTAssertEqual(fixture.store.pipelineCache[projectID]?.first?.state, .success)
         XCTAssertEqual(fixture.store.menuBarPipelineStatus.running, 0)
         XCTAssertEqual(fixture.store.selectedPipeline?.state, .success)
@@ -186,6 +190,7 @@ final class CIRefreshIsolationTests: XCTestCase {
         {"jobs":[{"id":1,"name":"Build","status":"completed","conclusion":"success"}]}
         """))
         try await eventually { fixture.store.pipelineCache[projectID]?.first?.hasLoadedStages == true }
+        try await eventually { !fixture.store.isRefreshingCI }
         XCTAssertEqual(fixture.store.pipelineCache[projectID]?.first?.state, .success)
         XCTAssertEqual(fixture.store.selectedPipeline?.state, .success)
         XCTAssertEqual(fixture.store.menuBarPipelineStatus.running, 0)
@@ -197,19 +202,24 @@ final class CIRefreshIsolationTests: XCTestCase {
         let fixture = makeFixture(instances: [], githubToken: "test-token")
         defer { fixture.cleanUp() }
         fixture.router.respond { request in
-            request.url!.path == "/user/repos" ? .json(self.githubRepositoryJSON) : .json(self.githubRunsJSON(status: "completed", conclusion: "success"))
+            if request.url!.path == "/user/repos" { return .json(self.githubRepositoryJSON) }
+            if request.url!.path.hasSuffix("/jobs") { return .json(self.githubJobsJSON()) }
+            return .json(self.githubRunsJSON(status: "completed", conclusion: "success"))
         }
         fixture.store.refreshCI()
         try await eventually { !fixture.store.isRefreshingCI }
         XCTAssertEqual(fixture.store.menuBarPipelineStatus.running, 0)
 
         fixture.router.respond { request in
-            request.url!.path == "/user/repos" ? .json("[]") : .json(self.githubRunsJSON(status: "in_progress", conclusion: nil))
+            if request.url!.path == "/user/repos" { return .json("[]") }
+            if request.url!.path.hasSuffix("/jobs") { return .json("{\"jobs\":[]}") }
+            return .json(self.githubRunsJSON(status: "in_progress", conclusion: nil))
         }
         fixture.store.refreshCI()
         try await eventually { !fixture.store.isRefreshingCI }
         XCTAssertEqual(fixture.store.pipelineCache["github:owner/example"]?.first?.state, .running)
         XCTAssertEqual(fixture.store.menuBarPipelineStatus.running, 1)
+        XCTAssertNil(fixture.store.ciError)
     }
 
     @MainActor
@@ -217,18 +227,161 @@ final class CIRefreshIsolationTests: XCTestCase {
         let fixture = makeFixture(instances: [], githubToken: "test-token")
         defer { fixture.cleanUp() }
         fixture.router.respond { request in
-            request.url!.path == "/user/repos" ? .json(self.githubRepositoryJSON) : .json(self.githubRunsJSON(status: "in_progress", conclusion: nil))
+            if request.url!.path == "/user/repos" { return .json(self.githubRepositoryJSON) }
+            if request.url!.path.hasSuffix("/jobs") { return .json("{\"jobs\":[]}") }
+            return .json(self.githubRunsJSON(status: "in_progress", conclusion: nil))
         }
         fixture.store.refreshCI()
         try await eventually { !fixture.store.isRefreshingCI }
         fixture.router.respond { request in
-            request.url!.path == "/user/repos" ? .json("[]") : .json(self.githubRunsJSON(status: "completed", conclusion: "failure"))
+            if request.url!.path == "/user/repos" { return .json("[]") }
+            if request.url!.path.hasSuffix("/jobs") { return .json(self.githubJobsJSON(conclusion: "failure")) }
+            return .json(self.githubRunsJSON(status: "completed", conclusion: "failure"))
         }
         fixture.store.refreshCI()
         try await eventually { !fixture.store.isRefreshingCI }
         XCTAssertEqual(fixture.store.pipelineCache["github:owner/example"]?.first?.state, .failed)
         XCTAssertEqual(fixture.store.menuBarPipelineStatus.running, 0)
         XCTAssertEqual(fixture.store.menuBarPipelineStatus.unreadFailures, 1)
+        XCTAssertNil(fixture.store.ciError)
+    }
+
+    @MainActor
+    func testGitHubAutomaticallyLoadsCompletedDetailsAndReusesFinalCache() async throws {
+        let fixture = makeFixture(instances: [], githubToken: "test-token")
+        defer { fixture.cleanUp() }
+        fixture.router.respond { request in
+            if request.url!.path == "/user/repos" { return .json(self.githubRepositoryJSON) }
+            if request.url!.path.hasSuffix("/jobs") { return .json(self.githubJobsJSON()) }
+            return .json(self.githubRunsJSON(status: "completed", conclusion: "success"))
+        }
+        fixture.store.refreshCIIfNeeded()
+        try await eventually { !fixture.store.isRefreshingCI }
+        let pipeline = try XCTUnwrap(fixture.store.pipelineCache["github:owner/example"]?.first)
+        XCTAssertEqual(pipeline.state, .success)
+        XCTAssertTrue(pipeline.hasLoadedStages, "No click on View should be necessary")
+        XCTAssertEqual(pipeline.stages.first?.name, "Build")
+        XCTAssertEqual(pipeline.stageSnapshotState, .success)
+        let requests = fixture.router.requests.filter { $0.url!.path.hasSuffix("/jobs") }.count
+        XCTAssertEqual(requests, 1)
+
+        fixture.store.refreshCI()
+        try await eventually { !fixture.store.isRefreshingCI }
+        XCTAssertEqual(fixture.router.requests.filter { $0.url!.path.hasSuffix("/jobs") }.count, requests)
+        XCTAssertFalse(fixture.router.requests.contains { $0.url!.path.contains("/logs") })
+    }
+
+    @MainActor
+    func testGitHubRetriesMissingCompletedDetailsAfterTimeoutWithoutRepositoryChanges() async throws {
+        var now = Date()
+        let fixture = makeFixture(instances: [], scheduler: CIRefreshScheduler(now: { now }), githubToken: "test-token")
+        defer { fixture.cleanUp() }
+        fixture.router.respond { request in
+            if request.url!.path == "/user/repos" { return .json(self.githubRepositoryJSON) }
+            if request.url!.path.hasSuffix("/jobs") { return .failure(.timedOut) }
+            return .json(self.githubRunsJSON(status: "completed", conclusion: "failure"))
+        }
+        fixture.store.refreshCIIfNeeded()
+        try await eventually { !fixture.store.isRefreshingCI }
+        let projectID = "github:owner/example"
+        XCTAssertEqual(fixture.store.pipelineCache[projectID]?.first?.state, .failed)
+        XCTAssertEqual(fixture.store.pipelineCache[projectID]?.first?.hasLoadedStages, false)
+        XCTAssertTrue(fixture.store.ciError?.contains("GitHub") == true)
+
+        fixture.router.respond { request in
+            if request.url!.path == "/user/repos" { return .json("[]") }
+            if request.url!.path.hasSuffix("/jobs") { return .json(self.githubJobsJSON(conclusion: "failure")) }
+            return .json(self.githubRunsJSON(status: "completed", conclusion: "failure"))
+        }
+        now.addTimeInterval(61)
+        fixture.store.refreshCIIfNeeded()
+        try await eventually { !fixture.store.isRefreshingCI }
+        XCTAssertEqual(fixture.store.pipelineCache[projectID]?.first?.hasLoadedStages, true)
+        XCTAssertEqual(fixture.store.pipelineCache[projectID]?.first?.stages.first?.state, .failed)
+        XCTAssertEqual(fixture.router.requests.filter { $0.url!.path.hasSuffix("/jobs") }.count, 2)
+        XCTAssertNil(fixture.store.ciError)
+        let reloaded = StackHubStore(defaults: fixture.defaults)
+        XCTAssertEqual(reloaded.pipelineCache[projectID]?.first?.stageSnapshotState, .failed)
+    }
+
+    @MainActor
+    func testGitHubPublishesSummaryAndOtherInstancesWhileJobsAreWaiting() async throws {
+        let online = instance("online")
+        let fixture = makeFixture(instances: [online], githubToken: "test-token")
+        defer { fixture.cleanUp() }
+        fixture.router.respond { request in
+            if request.url!.host == "online.test" {
+                return .json(request.url!.path.hasSuffix("/jobs") ? "[]" : self.pipelineJSON())
+            }
+            if request.url!.path == "/user/repos" { return .json(self.githubRepositoryJSON) }
+            if request.url!.path.hasSuffix("/jobs") { return .hold }
+            return .json(self.githubRunsJSON(status: "completed", conclusion: "success"))
+        }
+        fixture.store.refreshCIIfNeeded()
+        let projectID = "github:owner/example"
+        try await eventually {
+            fixture.store.pipelineCache[projectID]?.first?.state == .success &&
+            fixture.store.pipelineCache["gitlab:\(online.id.uuidString):1"]?.first?.state == .success &&
+            fixture.router.requests.contains { $0.url!.host == "api.github.com" && $0.url!.path.hasSuffix("/jobs") }
+        }
+        XCTAssertTrue(fixture.store.isRefreshingCI)
+        XCTAssertEqual(fixture.store.pipelineCache[projectID]?.first?.hasLoadedStages, false)
+        fixture.router.releaseHeld(host: "api.github.com", result: .json(githubJobsJSON()))
+        try await eventually { !fixture.store.isRefreshingCI }
+        XCTAssertEqual(fixture.store.pipelineCache[projectID]?.first?.hasLoadedStages, true)
+    }
+
+    @MainActor
+    func testGitHubRefreshesFinalJobsEvenWhenRunningSnapshotAlreadyHadDetails() async throws {
+        let fixture = makeFixture(instances: [], githubToken: "test-token")
+        defer { fixture.cleanUp() }
+        fixture.router.respond { request in
+            if request.url!.path == "/user/repos" { return .json(self.githubRepositoryJSON) }
+            // A job can complete before the overall workflow does.
+            if request.url!.path.hasSuffix("/jobs") { return .json(self.githubJobsJSON()) }
+            return .json(self.githubRunsJSON(status: "in_progress", conclusion: nil))
+        }
+        fixture.store.refreshCI()
+        try await eventually { !fixture.store.isRefreshingCI }
+        let projectID = "github:owner/example"
+        XCTAssertEqual(fixture.store.pipelineCache[projectID]?.first?.stageSnapshotState, .running)
+        fixture.router.respond { request in
+            if request.url!.path == "/user/repos" { return .json("[]") }
+            if request.url!.path.hasSuffix("/jobs") { return .json(self.githubJobsJSON()) }
+            return .json(self.githubRunsJSON(status: "completed", conclusion: "success"))
+        }
+        fixture.store.refreshCI()
+        try await eventually { !fixture.store.isRefreshingCI }
+        XCTAssertEqual(fixture.router.requests.filter { $0.url!.path.hasSuffix("/jobs") }.count, 2)
+        XCTAssertEqual(fixture.store.pipelineCache[projectID]?.first?.stageSnapshotState, .success)
+    }
+
+    @MainActor
+    func testGitLabRetriesMissingCompletedJobsAfterTheyLeaveTheIncrementalFeed() async throws {
+        let online = instance("online")
+        let fixture = makeFixture(instances: [online])
+        defer { fixture.cleanUp() }
+        fixture.router.respond { request in
+            request.url!.path.hasSuffix("/jobs") ? .http(403) : .json(self.pipelineJSON())
+        }
+        fixture.store.refreshCI()
+        try await eventually { !fixture.store.isRefreshingCI }
+        let projectID = "gitlab:\(online.id.uuidString):1"
+        XCTAssertEqual(fixture.store.pipelineCache[projectID]?.first?.hasLoadedStages, false)
+        fixture.router.respond { request in
+            if request.url!.path.hasSuffix("/jobs") {
+                return .json("[{\"id\":1,\"name\":\"Build\",\"stage\":\"build\",\"status\":\"success\",\"duration\":2}]")
+            }
+            return .json("[]")
+        }
+        fixture.store.refreshCI()
+        try await eventually { !fixture.store.isRefreshingCI }
+        XCTAssertEqual(fixture.store.pipelineCache[projectID]?.first?.hasLoadedStages, true)
+        XCTAssertEqual(fixture.router.requests.filter { $0.url!.path.hasSuffix("/jobs") }.count, 2)
+    }
+
+    private func githubJobsJSON(conclusion: String = "success") -> String {
+        "{\"jobs\":[{\"id\":1,\"name\":\"Build\",\"status\":\"completed\",\"conclusion\":\"\(conclusion)\"}]}"
     }
 
     private var githubRepositoryJSON: String {
