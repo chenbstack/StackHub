@@ -2566,37 +2566,80 @@ struct PipelineCard: View {
     let pipeline: Pipeline
     var monitoredProject: CIMonitoredProject?
     var instanceName: String?
+
+    private var providerTitle: String {
+        let provider = monitoredProject?.provider ?? pipeline.provider
+        guard let instance = instanceName ?? monitoredProject?.instanceName else { return provider }
+        return "\(provider) · \(instance)"
+    }
+
+    private var repositorySummary: String {
+        let repository = monitoredProject?.repository ?? pipeline.repository
+        let branch = monitoredProject?.branch ?? pipeline.branch
+        return "\(repository) / \(branch) · 17 分钟前"
+    }
+
+    private var pipelineTitle: String {
+        pipeline.id.hasPrefix("github") ? "构建与测试" : "发布流水线"
+    }
+
+    private var providerBadge: some View {
+        Text(pipeline.provider == "GitHub Actions" ? "GH" : "GL")
+            .font(.caption.weight(.bold))
+            .frame(width: 28, height: 28)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var cardHeader: some View {
+        HStack {
+            HStack(spacing: 9) {
+                providerBadge
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(providerTitle).font(.subheadline.weight(.semibold))
+                    Text(repositorySummary).font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            Label(pipeline.state.label, systemImage: "circle.fill")
+                .font(.caption2)
+                .foregroundStyle(pipeline.state.color)
+        }
+        .padding(.bottom, 11)
+    }
+
+    private var pipelineSummary: some View {
+        HStack(alignment: .bottom) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(pipelineTitle).font(.headline)
+                Text(pipeline.commit).font(.caption2).foregroundStyle(.secondary)
+            }
+            Spacer()
+            VStack(alignment: .trailing, spacing: 5) {
+                Text(pipeline.duration).font(.caption2).foregroundStyle(.secondary)
+                Button(pipeline.provider == "GitHub Actions" ? "查看运行" : "查看流水线") {
+                    store.openPipeline(pipeline)
+                }
+                .buttonStyle(StackSecondaryButtonStyle())
+                .controlSize(.small)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var gitLabStages: some View {
+        if pipeline.provider == "GitLab CI" {
+            Divider().padding(.vertical, 8)
+            ForEach(pipeline.stages) { stage in
+                StageRow(stage: stage)
+            }
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                HStack(spacing: 9) {
-                    Text(pipeline.provider == "GitHub Actions" ? "GH" : "GL")
-                        .font(.caption.weight(.bold)).frame(width: 28, height: 28)
-                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text((monitoredProject?.provider ?? pipeline.provider) + ((instanceName ?? monitoredProject?.instanceName).map { " · \($0)" } ?? "")).font(.subheadline.weight(.semibold))
-                        Text("\(monitoredProject?.repository ?? pipeline.repository) / \(monitoredProject?.branch ?? pipeline.branch) · 17 分钟前").font(.caption2).foregroundStyle(.secondary)
-                    }
-                }
-                Spacer()
-                Label(pipeline.state.label, systemImage: "circle.fill").font(.caption2).foregroundStyle(pipeline.state.color)
-            }
-            .padding(.bottom, 11)
-            HStack(alignment: .bottom) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(pipeline.id.hasPrefix("github") ? "构建与测试" : "发布流水线").font(.headline)
-                    Text(pipeline.commit).font(.caption2).foregroundStyle(.secondary)
-                }
-                Spacer()
-                VStack(alignment: .trailing, spacing: 5) {
-                    Text(pipeline.duration).font(.caption2).foregroundStyle(.secondary)
-                    Button(pipeline.provider == "GitHub Actions" ? "查看运行" : "查看流水线") { store.openPipeline(pipeline) }.buttonStyle(StackSecondaryButtonStyle()).controlSize(.small)
-                }
-            }
-            if pipeline.provider == "GitLab CI" {
-                Divider().padding(.vertical, 8)
-                ForEach(pipeline.stages) { stage in StageRow(stage: stage) }
-            }
+            cardHeader
+            pipelineSummary
+            gitLabStages
         }
         .padding(13)
         .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14))
