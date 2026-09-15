@@ -199,6 +199,12 @@
 "查看运行" = "View run";
 "查看" = "View";
 "阶段" = "Stages";
+"正在加载步骤…" = "Loading steps…";
+"阶段：%@" = "Stage: %@";
+"%ld 个作业" = "%ld jobs";
+"阶段 %@，%ld 个作业" = "Stage %@, %ld jobs";
+"阶段 %@，%@，%ld 个作业，点击查看步骤" = "Stage %@, %@, %ld jobs. Click to view steps.";
+"作业 %@，%@，点击查看日志" = "Job %@, %@. Click to view log.";
 "最新流水线" = "Latest pipelines";
 "点击查看历史" = "View history";
 "最近 5 条流水线" = "Latest 5 pipelines";

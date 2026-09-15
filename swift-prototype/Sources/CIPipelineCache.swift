@@ -1,6 +1,23 @@
 import Foundation
 
 enum CIPipelineCache {
+    /// Incremental providers return only the pipelines that changed since the
+    /// last cursor. Merge those summaries into the local recent list instead
+    /// of replacing unchanged pipelines from other projects or earlier pages.
+    static func mergingRecent(_ refreshed: [Pipeline], with previous: [Pipeline], limit: Int = 5) -> [Pipeline] {
+        var merged: [String: Pipeline] = [:]
+        for pipeline in previous {
+            merged[pipeline.id] = pipeline
+        }
+        for pipeline in refreshed {
+            merged[pipeline.id] = merging(pipeline, with: merged[pipeline.id])
+        }
+        return merged.values
+            .sorted(by: CIActivityOrdering.newestFirst)
+            .prefix(max(limit, 0))
+            .map { $0 }
+    }
+
     /// Replace the summary placeholder with job/stage statuses while retaining
     /// logs that were loaded earlier for the same job.
     static func merging(_ refreshed: Pipeline, with previous: Pipeline?) -> Pipeline {
@@ -13,7 +30,14 @@ enum CIPipelineCache {
         let previousByID = Dictionary(uniqueKeysWithValues: previous.stages.map { ($0.id, $0) })
         let stages = refreshed.stages.map { stage in
             guard let old = previousByID[stage.id], !old.log.isEmpty else { return stage }
-            return PipelineStage(id: stage.id, name: stage.name, duration: stage.duration, state: stage.state, log: old.log)
+            return PipelineStage(
+                id: stage.id,
+                name: stage.name,
+                duration: stage.duration,
+                state: stage.state,
+                log: old.log,
+                group: stage.group
+            )
         }
         return copy(refreshed, stages: stages, hasLoadedStages: true)
     }
@@ -23,10 +47,11 @@ enum CIPipelineCache {
         let stages = jobs.map { job in
             PipelineStage(
                 id: job.id,
-                name: job.stage.isEmpty ? job.name : "\(job.stage) · \(job.name)",
+                name: job.name,
                 duration: job.duration,
                 state: job.state,
-                log: ""
+                log: "",
+                group: job.stage.isEmpty ? nil : job.stage
             )
         }
         return copy(pipeline, stages: stages, hasLoadedStages: true)

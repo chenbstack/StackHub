@@ -164,6 +164,53 @@ final class CIActivityOrderingTests: XCTestCase {
         XCTAssertEqual(merged.commit, refreshed.commit)
     }
 
+    func testIncrementalPipelineMergePreservesUnchangedPipelines() {
+        let repository = project("gitlab:one:1", provider: "GitLab CI")
+        let unchanged = pipeline("gitlab-older", project: repository, timestamp: 100)
+        let oldVersion = pipeline("gitlab-current", project: repository, timestamp: 200)
+        let refreshed = pipeline("gitlab-current", project: repository, timestamp: 300)
+
+        let merged = CIPipelineCache.mergingRecent([refreshed], with: [oldVersion, unchanged])
+
+        XCTAssertEqual(merged.map(\.id), [refreshed.id, unchanged.id])
+        XCTAssertEqual(merged.first?.updatedAt, refreshed.updatedAt)
+    }
+
+    func testRefreshProfilerAggregatesRequestTimingsByStep() {
+        let startedAt = Date(timeIntervalSince1970: 100)
+        let profiler = CIRefreshProfiler(startedAt: startedAt)
+        profiler.record("GitLab · 全局流水线", duration: 0.4, requests: 1)
+        profiler.record("GitLab · 全局流水线", duration: 0.6, requests: 1)
+        profiler.record("GitLab · 作业步骤", duration: 0.2, requests: 2)
+
+        let report = profiler.report(
+            completedAt: Date(timeIntervalSince1970: 102),
+            projectCount: 3,
+            pipelineCount: 7,
+            errorCount: 0
+        )
+
+        XCTAssertEqual(report.totalDuration, 2)
+        XCTAssertEqual(report.components.map(\.name), ["GitLab · 全局流水线", "GitLab · 作业步骤"])
+        XCTAssertEqual(report.components.first?.duration, 1)
+        XCTAssertEqual(report.components.first?.requestCount, 2)
+        XCTAssertEqual(CIRefreshTimingFormatter.duration(0.123), "123 ms")
+    }
+
+    func testMenuBarStatusCountsRunningPipelinesAndOnlyUnreadFailures() {
+        let repository = project("gitlab:one:1", provider: "GitLab CI")
+        let acknowledgedFailure = pipeline("failed-seen", project: repository, timestamp: 100, state: .failed)
+        let unreadFailure = pipeline("failed-new", project: repository, timestamp: 200, state: .failed)
+        let running = pipeline("running", project: repository, timestamp: 300, state: .running)
+
+        let cache = [repository.id: [acknowledgedFailure, unreadFailure, running]]
+        let acknowledged = [CIPipelineStatusCounter.failureID(for: acknowledgedFailure)]
+        let counts = CIPipelineStatusCounter.counts(in: cache, acknowledgedFailureIDs: Set(acknowledged))
+
+        XCTAssertEqual(counts.running, 1)
+        XCTAssertEqual(counts.unreadFailures, 1)
+    }
+
     func testPrefetchStageLimitDoesNotFetchBeyondSelectedProjects() async {
         let repositories = (1...4).map { project("github:owner/\($0)") }
         let candidates = repositories.enumerated().map { index, repository in
@@ -188,6 +235,23 @@ final class CIActivityOrderingTests: XCTestCase {
         XCTAssertEqual(detailed?.stages.first?.log, "")
     }
 
+    func testGroupsDynamicJobsUnderTheirProviderStage() {
+        let repository = project("gitlab:one:1", provider: "GitLab CI")
+        let pipeline = pipeline("gitlab-42", project: repository, timestamp: 100)
+        let jobs = [
+            RemoteJob(id: "job-1", name: "docker-release: [admin]", stage: "build", status: "success", duration: "1 分钟", log: ""),
+            RemoteJob(id: "job-2", name: "docker-release: [agent]", stage: "build", status: "running", duration: "—", log: ""),
+            RemoteJob(id: "job-3", name: "deploy", stage: "deploy", status: "success", duration: "2 分钟", log: "")
+        ]
+
+        let groups = CIPipelineCache.withJobs(pipeline, jobs: jobs)?.stages.groupedPipelineStages
+
+        XCTAssertEqual(groups?.map(\.name), ["build", "deploy"])
+        XCTAssertEqual(groups?.first?.jobs.map(\.name), ["docker-release: [admin]", "docker-release: [agent]"])
+        XCTAssertEqual(groups?.first?.state, .running)
+        XCTAssertEqual(groups?.last?.jobs.count, 1)
+    }
+
     private func project(
         _ id: String,
         name: String? = nil,
@@ -200,10 +264,15 @@ final class CIActivityOrderingTests: XCTestCase {
         )
     }
 
-    private func pipeline(_ id: String, project: CIAccessibleProject, timestamp: TimeInterval?) -> Pipeline {
+    private func pipeline(
+        _ id: String,
+        project: CIAccessibleProject,
+        timestamp: TimeInterval?,
+        state: PipelineState = .success
+    ) -> Pipeline {
         Pipeline(
             id: id, projectID: project.id, provider: project.provider, repository: project.repository,
-            branch: "main", commit: "test", duration: "—", state: .success, stages: [],
+            branch: "main", commit: "test", duration: "—", state: state, stages: [],
             updatedAt: timestamp.map { Date(timeIntervalSince1970: $0) }, webURL: nil
         )
     }

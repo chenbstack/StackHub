@@ -236,7 +236,7 @@ final class GitHubAPIClient {
 
     func jobLog(owner: String, repository: String, jobID: String) async throws -> String {
         let url = try makeURL(path: "/repos/\(owner)/\(repository)/actions/jobs/\(jobID)/logs")
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: url, timeoutInterval: 10)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         let (data, response) = try await session.data(for: request)
@@ -286,7 +286,7 @@ final class GitHubAPIClient {
     }
 
     private func send<T: Decodable>(_ url: URL) async throws -> T {
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: url, timeoutInterval: 10)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
@@ -363,6 +363,12 @@ final class GitLabAPIClient {
     private let decoder: JSONDecoder
     private let projectIDPrefix: String?
 
+    private static let iso8601Formatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
     init(instanceURL: String, token: String, session: URLSession = .shared, projectIDPrefix: String? = nil) throws {
         var normalized = instanceURL.trimmingCharacters(in: .whitespacesAndNewlines)
         if !normalized.contains("://") { normalized = "https://\(normalized)" }
@@ -413,26 +419,58 @@ final class GitLabAPIClient {
     /// GitLab 的全局流水线活动接口。它一次返回多个项目的近期流水线，
     /// 由调用方根据 project_id 分组，避免对每个项目逐一请求。
     /// GitLab 官方定义该接口返回当前账号触发的近期流水线。
-    func recentPipelines(limit: Int = 100) async throws -> [RemotePipeline] {
-        let url = try makeURL(path: "/api/v4/pipelines", query: [
+    func recentPipelines(limit: Int = 100, createdAfter: Date? = nil) async throws -> [RemotePipeline] {
+        var query = [
             URLQueryItem(name: "per_page", value: "\(min(max(limit, 1), 100))"),
             URLQueryItem(name: "order_by", value: "created_at"),
             URLQueryItem(name: "sort", value: "desc")
-        ])
+        ]
+        if let createdAfter {
+            query.append(URLQueryItem(name: "created_after", value: Self.iso8601Formatter.string(from: createdAfter)))
+        }
+        let url = try makeURL(path: "/api/v4/pipelines", query: query)
         let response: [GitLabPipeline] = try await send(url)
         let prefix = projectIDPrefix ?? baseURL.host ?? "instance"
         return response.map { makeRemotePipeline($0, prefix: prefix) }
     }
 
+    /// Resolves one project only when an older global-pipeline response does
+    /// not include project metadata. This is deliberately not a project-list
+    /// request, so supported GitLab instances never enumerate repositories.
+    func project(projectID: String) async throws -> RemoteProject {
+        let url = try makeURL(path: "/api/v4/projects/\(apiProjectID(projectID))")
+        let response: GitLabProject = try await send(url)
+        let prefix = projectIDPrefix ?? baseURL.host ?? "instance"
+        return makeRemoteProject(response, prefix: prefix)
+    }
+
+    /// The global feed is incremental by creation time. Existing pipelines
+    /// that are still running need this small direct refresh so their terminal
+    /// state is not missed after they fall behind the creation cursor.
+    func pipeline(projectID: String, pipelineID: String) async throws -> RemotePipeline {
+        let url = try makeURL(path: "/api/v4/projects/\(apiProjectID(projectID))/pipelines/\(pipelineID)")
+        let response: GitLabPipeline = try await send(url)
+        let prefix = projectIDPrefix ?? baseURL.host ?? "instance"
+        return makeRemotePipeline(response, prefix: prefix)
+    }
+
     /// Compatibility path for GitLab versions without the global pipeline
-    /// feed. The caller limits this to a small number of recently active
-    /// projects so an old instance cannot trigger a request storm.
-    func recentPipelines(projectID: String, limit: Int = 5) async throws -> [RemotePipeline] {
-        let url = try makeURL(path: "/api/v4/projects/\(apiProjectID(projectID))/pipelines", query: [
+    /// feed. `updated_after` lets callers retain a per-project cursor so
+    /// already-indexed history is not transferred again on every poll.
+    func recentPipelines(
+        projectID: String,
+        limit: Int = 5,
+        updatedAfter: Date? = nil
+    ) async throws -> [RemotePipeline] {
+        var query = [
             URLQueryItem(name: "per_page", value: "\(min(max(limit, 1), 100))"),
             URLQueryItem(name: "order_by", value: "updated_at"),
             URLQueryItem(name: "sort", value: "desc")
-        ])
+        ]
+        if let updatedAfter {
+            query.append(URLQueryItem(name: "updated_after", value: Self.iso8601Formatter.string(from: updatedAfter)))
+        }
+        let url = try makeURL(path: "/api/v4/projects/\(apiProjectID(projectID))/pipelines", query: query)
         let response: [GitLabPipeline] = try await send(url)
         let prefix = projectIDPrefix ?? baseURL.host ?? "instance"
         return response.map { makeRemotePipeline($0, prefix: prefix) }
@@ -449,7 +487,7 @@ final class GitLabAPIClient {
 
     func jobLog(projectID: String, jobID: String) async throws -> String {
         let url = try makeURL(path: "/api/v4/projects/\(apiProjectID(projectID))/jobs/\(jobID)/trace")
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: url, timeoutInterval: 10)
         request.setValue(token, forHTTPHeaderField: "PRIVATE-TOKEN")
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw CIIntegrationError.http(-1, "无效响应") }
@@ -467,7 +505,15 @@ final class GitLabAPIClient {
             repository: pipeline.project?.pathWithNamespace ?? "", branch: pipeline.ref,
             commit: "\(String(pipeline.sha.prefix(7))) · GitLab", status: pipeline.status,
             duration: CIExecutionTimeFormatter.duration(seconds: pipeline.duration),
-            webURL: pipeline.webURL, updatedAt: pipeline.updatedAt ?? pipeline.createdAt, startedAt: pipeline.createdAt
+            webURL: pipeline.webURL, updatedAt: pipeline.updatedAt ?? pipeline.createdAt, startedAt: pipeline.startedAt ?? pipeline.createdAt
+        )
+    }
+
+    private func makeRemoteProject(_ project: GitLabProject, prefix: String) -> RemoteProject {
+        RemoteProject(
+            id: "gitlab:\(prefix):\(project.id)", name: project.name,
+            repository: project.pathWithNamespace, branch: project.defaultBranch ?? "main",
+            provider: "GitLab CI", instanceName: baseURL.host, updatedAt: nil
         )
     }
 
@@ -481,7 +527,7 @@ final class GitLabAPIClient {
     }
 
     private func send<T: Decodable>(_ url: URL) async throws -> T {
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: url, timeoutInterval: 10)
         request.setValue(token, forHTTPHeaderField: "PRIVATE-TOKEN")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         let (data, response) = try await session.data(for: request)
@@ -514,6 +560,7 @@ private struct GitLabPipeline: Decodable {
     let duration: Double?
     let updatedAt: Date?
     let createdAt: Date?
+    let startedAt: Date?
     let project: GitLabPipelineProject?
 
     enum CodingKeys: String, CodingKey {
@@ -522,6 +569,7 @@ private struct GitLabPipeline: Decodable {
         case webURL = "web_url"
         case updatedAt = "updated_at"
         case createdAt = "created_at"
+        case startedAt = "started_at"
     }
 }
 

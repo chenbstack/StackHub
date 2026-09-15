@@ -3,6 +3,12 @@ import XCTest
 @testable import StackHub
 
 final class ServiceDirectoryTests: XCTestCase {
+    func testPanelHeightOnlyShrinksOnOpenWhenItExceedsScreenNinetyPercent() {
+        XCTAssertEqual(PanelWindowSizing.openingHeight(640, visibleScreenHeight: 900), 640)
+        XCTAssertEqual(PanelWindowSizing.openingHeight(1_000, visibleScreenHeight: 900), 810)
+        XCTAssertEqual(PanelWindowSizing.openingHeight(1_000, visibleScreenHeight: 0), 1_000)
+    }
+
     func testStartupEvidencePrioritizesErrorsOverReadySignals() {
         XCTAssertEqual(ServiceStartupEvidence.classify(log: "Server listening on http://127.0.0.1:3000"), .ready)
         XCTAssertEqual(ServiceStartupEvidence.classify(log: "启动完成\nERROR: unable to bind port"), .warning)

@@ -1,6 +1,18 @@
 import SwiftUI
 import AppKit
 
+enum PanelWindowSizing {
+    static let minimumHeight: CGFloat = 500
+
+    /// The persisted panel size is intentionally not capped. It is only
+    /// reduced when opening on a screen that can no longer contain it, such
+    /// as after changing display resolution or moving to another display.
+    static func openingHeight(_ requestedHeight: CGFloat, visibleScreenHeight: CGFloat) -> CGFloat {
+        guard visibleScreenHeight > 0 else { return requestedHeight }
+        return min(requestedHeight, visibleScreenHeight * 0.9)
+    }
+}
+
 /// A native AppKit tracking view gives the menu-bar window a real bottom-edge
 /// resize affordance.  The top edge remains anchored while the pointer moves,
 /// which feels like resizing a popover instead of stretching its contents.
@@ -57,10 +69,9 @@ final class ResizeTrackingView: NSView {
     override func mouseDragged(with event: NSEvent) {
         guard let window, let startHeight = dragStartHeight, let startMouseY = dragStartMouseY else { return }
         let delta = startMouseY - NSEvent.mouseLocation.y
-        let minimum: CGFloat = 500
-        let screenMaximum = (window.screen ?? NSScreen.main)?.visibleFrame.height ?? 900
-        let maximum = max(minimum, min(CGFloat(820), screenMaximum - 36))
-        let newHeight = min(max(startHeight + delta, minimum), maximum)
+        // Let people size the panel as tall as they need. A display-aware
+        // safety clamp runs only when it is opened or its screen changes.
+        let newHeight = max(startHeight + delta, PanelWindowSizing.minimumHeight)
         var frame = window.frame
         let top = frame.maxY
         frame.size.height = newHeight
@@ -80,26 +91,77 @@ final class ResizeTrackingView: NSView {
 /// a clipped SwiftUI surface.  Clearing it removes the light halo/white border
 /// while keeping the system's panel positioning and shadow behavior intact.
 struct PanelWindowTuner: NSViewRepresentable {
+    @Binding var height: Double
+
+    func makeCoordinator() -> Coordinator { Coordinator(height: $height) }
+
     func makeNSView(context: Context) -> PanelWindowTuningView {
-        PanelWindowTuningView(frame: .zero)
+        let view = PanelWindowTuningView(frame: .zero)
+        view.onHeightAdjusted = { newHeight in
+            context.coordinator.height.wrappedValue = newHeight
+        }
+        return view
     }
 
     func updateNSView(_ nsView: PanelWindowTuningView, context: Context) {
-        configureWindow(nsView.window)
+        nsView.onHeightAdjusted = { newHeight in
+            context.coordinator.height.wrappedValue = newHeight
+        }
+        nsView.configureWindow()
+    }
+
+    final class Coordinator {
+        var height: Binding<Double>
+        init(height: Binding<Double>) { self.height = height }
     }
 }
 
 final class PanelWindowTuningView: NSView {
+    var onHeightAdjusted: ((Double) -> Void)?
+    private weak var observedWindow: NSWindow?
+    private var screenObservers: [NSObjectProtocol] = []
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        configureWindow(window)
+        observeScreenChanges(for: window)
+        configureWindow()
         // MenuBarExtra may apply its panel style one run-loop later; applying
-        // once more after attachment makes the border removal deterministic.
-        DispatchQueue.main.async { [weak self] in configureWindow(self?.window) }
+        // once more after attachment lets us measure the actual target screen.
+        DispatchQueue.main.async { [weak self] in self?.configureWindow() }
+    }
+
+    deinit { removeScreenObservers() }
+
+    func configureWindow() {
+        tunePanelWindow(window, onHeightAdjusted: onHeightAdjusted)
+    }
+
+    private func observeScreenChanges(for window: NSWindow?) {
+        guard observedWindow !== window else { return }
+        removeScreenObservers()
+        observedWindow = window
+        guard let window else { return }
+
+        let center = NotificationCenter.default
+        screenObservers = [
+            center.addObserver(forName: NSWindow.didChangeScreenNotification, object: window, queue: .main) { [weak self] _ in
+                self?.configureWindow()
+            },
+            center.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.configureWindow()
+            }
+        ]
+    }
+
+    private func removeScreenObservers() {
+        let center = NotificationCenter.default
+        screenObservers.forEach(center.removeObserver)
+        screenObservers.removeAll()
+        observedWindow = nil
     }
 }
 
-private func configureWindow(_ window: NSWindow?) {
+private func tunePanelWindow(_ window: NSWindow?, onHeightAdjusted: ((Double) -> Void)? = nil) {
     guard let window else { return }
     // MenuBarExtra(.window) uses a titled NSPanel under the hood. Its native
     // frame draws the light outline seen outside the SwiftUI clip. Keep the
@@ -115,4 +177,19 @@ private func configureWindow(_ window: NSWindow?) {
     window.contentView?.layer?.backgroundColor = NSColor.clear.cgColor
     window.contentView?.layer?.cornerRadius = 20
     window.contentView?.layer?.masksToBounds = true
+
+    guard let screen = window.screen ?? NSScreen.main else { return }
+    let adjustedHeight = PanelWindowSizing.openingHeight(
+        window.frame.height,
+        visibleScreenHeight: screen.visibleFrame.height
+    )
+    guard adjustedHeight < window.frame.height else { return }
+
+    var frame = window.frame
+    let visibleFrame = screen.visibleFrame
+    let top = min(frame.maxY, visibleFrame.maxY)
+    frame.size.height = adjustedHeight
+    frame.origin.y = max(visibleFrame.minY, top - adjustedHeight)
+    window.setFrame(frame, display: true)
+    onHeightAdjusted?(Double(adjustedHeight))
 }

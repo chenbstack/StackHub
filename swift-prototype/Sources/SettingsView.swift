@@ -192,7 +192,7 @@ struct CIInstanceManagementDetailView: View {
                 subtitle: "管理 GitHub 授权和 GitLab 实例",
                 onClose: onClose
             )
-            ScrollView {
+            OverlayScrollView {
                 CIConnectionsSection(
                     onManageGitHub: onManageGitHub,
                     onAddGitLab: onAddGitLab,
@@ -220,7 +220,7 @@ struct ProjectEditorDetailView: View {
                 subtitle: "配置本地工作目录、服务和启动命令",
                 onClose: onClose
             )
-            ScrollView {
+            OverlayScrollView {
                 ProjectInlineEditor(draft: draft, onSave: saveProject, onCancel: onClose)
                     .padding(16)
             }
@@ -254,7 +254,7 @@ struct GitHubAuthorizationDetailView: View {
                 subtitle: "连接后同步仓库、Actions 和作业日志",
                 onClose: onClose
             )
-            ScrollView {
+            OverlayScrollView {
                 GitHubInlineEditor(
                     isConnected: store.isGitHubConnected,
                     oauth: oauth,
@@ -291,7 +291,7 @@ struct GitLabInstanceDetailView: View {
                 subtitle: "实例地址和 Token 仅保存在本机",
                 onClose: onClose
             )
-            ScrollView {
+            OverlayScrollView {
                 GitLabInlineEditor(draft: draft, hasExistingToken: draft.hasExistingToken, onSave: saveGitLab, onCancel: onClose)
                     .padding(16)
             }

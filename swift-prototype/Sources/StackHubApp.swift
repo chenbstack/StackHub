@@ -2,36 +2,181 @@ import SwiftUI
 import AppKit
 import Combine
 
+private final class StackHubPanelWindow: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+@MainActor
 final class StackHubAppDelegate: NSObject, NSApplicationDelegate {
-    var store: StackHubStore?
+    let store = StackHubStore()
+    private var statusItem: NSStatusItem?
+    private var panelWindow: NSPanel?
+    private var statusObservation: AnyCancellable?
+    private var localPopoverDismissMonitor: Any?
+    private var globalPopoverDismissMonitor: Any?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        installStatusItem()
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         // AppKit invokes this delegate callback on the main thread. The store
         // owns the Process instances, so stop them before the app exits.
-        MainActor.assumeIsolated {
-            store?.stopAllServices()
-        }
+        store.stopAllServices()
         return .terminateNow
+    }
+
+    private func installStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        guard let button = item.button else { return }
+
+        button.target = self
+        button.action = #selector(togglePanel(_:))
+        let iconConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [.white]))
+        button.image = NSImage(
+            systemSymbolName: "square.stack.3d.up.fill",
+            accessibilityDescription: "StackHub"
+        )?.withSymbolConfiguration(iconConfiguration)
+        // A template image is recolored by AppKit's status-bar appearance.
+        // Keep this rendered white symbol non-template so it remains legible
+        // over the user's light, translucent menu bar.
+        button.image?.isTemplate = false
+        button.imagePosition = .imageOnly
+        // Match the menu-bar template convention used by the surrounding
+        // status icons instead of adapting to the desktop wallpaper's light
+        // appearance, which can otherwise render the icon black.
+        button.contentTintColor = nil
+        button.toolTip = "StackHub"
+        statusItem = item
+
+        // NSPopover always owns a native arrow and bezel. That bezel becomes
+        // visible as a light fringe around our fully custom dark surface, so
+        // use a borderless panel anchored beneath the status item instead.
+        let panel = StackHubPanelWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 410, height: 640),
+            styleMask: [.borderless, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isFloatingPanel = true
+        panel.level = .popUpMenu
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        panel.contentViewController = NSHostingController(
+            rootView: StackHubPanel().environmentObject(store)
+        )
+        panelWindow = panel
+
+        statusObservation = store.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { self?.updateStatusItem() }
+        }
+        updateStatusItem()
+    }
+
+    private func updateStatusItem() {
+        guard let statusItem, let button = statusItem.button else { return }
+        let status = store.menuBarPipelineStatus
+        let lines = [
+            status.running > 0 ? "RUN \(status.running)" : nil,
+            status.unreadFailures > 0 ? "FAIL \(status.unreadFailures)" : nil
+        ].compactMap { $0 }
+        let title = lines.joined(separator: "\n")
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 6, weight: .medium)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.minimumLineHeight = 6
+        paragraph.maximumLineHeight = 6
+        paragraph.lineSpacing = -1
+        paragraph.alignment = .left
+        button.attributedTitle = NSAttributedString(
+            string: title,
+            attributes: [
+                .font: font,
+                .foregroundColor: NSColor.white,
+                .paragraphStyle: paragraph,
+                .kern: -0.15
+            ]
+        )
+        button.font = font
+        button.imagePosition = title.isEmpty ? .imageOnly : .imageLeft
+
+        let textWidth = (title as NSString).boundingRect(
+            with: NSSize(width: 80, height: 24),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font, .paragraphStyle: paragraph]
+        ).width
+        statusItem.length = ceil(title.isEmpty ? 22 : 22 + textWidth + 6)
+    }
+
+    @objc private func togglePanel(_ sender: Any?) {
+        guard let button = statusItem?.button, let panelWindow else { return }
+        if panelWindow.isVisible {
+            panelWindow.orderOut(sender)
+            removePopoverDismissMonitors()
+        } else {
+            showPanel(panelWindow, below: button)
+            installPopoverDismissMonitors()
+        }
+    }
+
+    private func showPanel(_ panel: NSPanel, below button: NSStatusBarButton) {
+        guard let buttonWindow = button.window else { return }
+        let buttonFrame = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
+        let screenFrame = buttonWindow.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
+        let panelFrame = panel.frame
+        let horizontalMargin: CGFloat = 8
+        let originX = min(
+            max(buttonFrame.midX - panelFrame.width / 2, screenFrame.minX + horizontalMargin),
+            screenFrame.maxX - panelFrame.width - horizontalMargin
+        )
+        let originY = max(screenFrame.minY + horizontalMargin, buttonFrame.minY - panelFrame.height - 6)
+        panel.setFrameOrigin(NSPoint(x: originX, y: originY))
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    private func installPopoverDismissMonitors() {
+        removePopoverDismissMonitors()
+        localPopoverDismissMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            guard let self, self.panelWindow?.isVisible == true else { return event }
+            if event.window !== self.panelWindow {
+                self.panelWindow?.orderOut(nil)
+                self.removePopoverDismissMonitors()
+            }
+            return event
+        }
+        globalPopoverDismissMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.panelWindow?.orderOut(nil)
+                self?.removePopoverDismissMonitors()
+            }
+        }
+    }
+
+    private func removePopoverDismissMonitors() {
+        if let localPopoverDismissMonitor {
+            NSEvent.removeMonitor(localPopoverDismissMonitor)
+            self.localPopoverDismissMonitor = nil
+        }
+        if let globalPopoverDismissMonitor {
+            NSEvent.removeMonitor(globalPopoverDismissMonitor)
+            self.globalPopoverDismissMonitor = nil
+        }
     }
 }
 
 @main
-struct StackHubApp: App {
-    @NSApplicationDelegateAdaptor(StackHubAppDelegate.self) private var appDelegate
-    @StateObject private var store = StackHubStore()
-
-    var body: some Scene {
-        MenuBarExtra {
-            StackHubPanel()
-                .environmentObject(store)
-                .onAppear { appDelegate.store = store }
-        } label: {
-            Image(systemName: "square.stack.3d.up.fill")
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(.purple)
-        }
-        .menuBarExtraStyle(.window)
-
+struct StackHubApp {
+    static func main() {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        let appDelegate = StackHubAppDelegate()
+        application.delegate = appDelegate
+        application.run()
     }
 }
 
@@ -319,6 +464,59 @@ struct PipelineStage: Identifiable, Codable {
     let duration: String
     let state: PipelineState
     let log: String
+    /// CI providers expose individual jobs. GitLab also assigns those jobs to
+    /// a named stage, which lets the UI present one stage with dynamic jobs
+    /// underneath instead of treating every job as a linear pipeline step.
+    let group: String?
+
+    init(
+        id: String,
+        name: String,
+        duration: String,
+        state: PipelineState,
+        log: String,
+        group: String? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.duration = duration
+        self.state = state
+        self.log = log
+        self.group = group
+    }
+}
+
+struct PipelineStageGroup: Identifiable {
+    let id: String
+    let name: String
+    let jobs: [PipelineStage]
+
+    var state: PipelineState {
+        if jobs.contains(where: { $0.state == .failed }) { return .failed }
+        if jobs.contains(where: { $0.state == .running }) { return .running }
+        return .success
+    }
+}
+
+extension Array where Element == PipelineStage {
+    /// Preserve the provider response order while grouping GitLab's jobs by
+    /// their stage. A missing group is a single standalone job (as returned
+    /// by GitHub Actions and legacy cached data).
+    var groupedPipelineStages: [PipelineStageGroup] {
+        var names: [String] = []
+        var jobsByName: [String: [PipelineStage]] = [:]
+
+        for job in self {
+            let normalizedGroup = job.group?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = normalizedGroup.flatMap { $0.isEmpty ? nil : $0 } ?? job.name
+            if jobsByName[name] == nil { names.append(name) }
+            jobsByName[name, default: []].append(job)
+        }
+
+        return names.enumerated().map { index, name in
+            PipelineStageGroup(id: "\(index)-\(name)", name: name, jobs: jobsByName[name] ?? [])
+        }
+    }
 }
 
 struct Pipeline: Identifiable, Codable {
@@ -371,10 +569,8 @@ struct Pipeline: Identifiable, Codable {
 
 extension Pipeline {
     /// The compact execution-time copy used by followed-project cards.
-    var executionDurationLabel: String {
-        guard duration != "—" else {
-            return state == .running ? L("执行中") : L("耗时未知")
-        }
+    var executionDurationLabel: String? {
+        guard duration != "—" else { return nil }
         return LF("执行 %@", duration)
     }
 
@@ -411,6 +607,13 @@ final class StackHubStore: ObservableObject {
     private static let pipelineCacheKey = "stackhub.ci.pipeline-cache"
     private static let githubRepositorySyncDateKey = "stackhub.ci.github-repository-sync-date"
     private static let githubFullDiscoveryDateKey = "stackhub.ci.github-full-discovery-date"
+    private static let gitLabPipelineSyncDateKey = "stackhub.ci.gitlab-pipeline-sync-dates"
+    private static let gitLabProjectPipelineSyncDateKey = "stackhub.ci.gitlab-project-pipeline-sync-dates"
+    private static let gitLabGlobalPipelineCapabilityKey = "stackhub.ci.gitlab-global-pipeline-capabilities"
+    private static let acknowledgedFailedPipelineIDsKey = "stackhub.ci.acknowledged-failure-ids"
+    // The global GitLab feed filters by creation time. Keep a small overlap so
+    // a refresh that lands on the cursor boundary cannot lose a pipeline.
+    private static let gitLabPipelineSyncOverlap: TimeInterval = 90
     private static let githubConnectedMetadataKey = "stackhub.github.connected"
     private static let credentialBundleAccount = "ci.credentials.v1"
     static let ciRefreshInterval: TimeInterval = 30
@@ -429,6 +632,20 @@ final class StackHubStore: ObservableObject {
     @Published var ciError: String?
     private(set) var lastGitHubRepositorySync: Date?
     private(set) var lastGitHubFullDiscovery: Date?
+    private var gitLabPipelineSyncDates: [String: Date] = [:]
+    private var gitLabProjectPipelineSyncDates: [String: Date] = [:]
+    /// `GET /pipelines` exists only on newer GitLab releases. Remember a
+    /// confirmed 404/405 so older instances do not pay for the same failed
+    /// feature probe on every 30-second refresh.
+    private var gitLabGlobalPipelineCapabilities: [String: Bool] = [:]
+    /// Detail lookups are demand-loaded for visible activity cards. Keep the
+    /// in-flight set separate from the refresh cursor so opening a long list
+    /// never creates duplicate per-pipeline requests.
+    private var hydratingGitLabPipelineTimingIDs: Set<String> = []
+    /// Failures remain visible in the menu bar until the CI screen has been
+    /// opened. Persist this small acknowledgement set so a relaunch does not
+    /// re-notify failures the user has already seen.
+    @Published private(set) var acknowledgedFailedPipelineIDs: Set<String> = []
     @Published var selectedInstanceID: UUID?
     @Published var selectedCIProjectID: String?
     @Published var expandedStageID: String? = "test"
@@ -510,6 +727,20 @@ final class StackHubStore: ObservableObject {
         CIActivityOrdering.latestActivities(projects: accessibleCIProjects, pipelineCache: pipelineCache)
     }
 
+    var menuBarPipelineStatus: CIPipelineStatusCounts {
+        CIPipelineStatusCounter.counts(
+            in: pipelineCache,
+            acknowledgedFailureIDs: acknowledgedFailedPipelineIDs
+        )
+    }
+
+    func acknowledgeCIFailures() {
+        let failedIDs = CIPipelineStatusCounter.failedPipelineIDs(in: pipelineCache)
+        guard acknowledgedFailedPipelineIDs != failedIDs else { return }
+        acknowledgedFailedPipelineIDs = failedIDs
+        defaults.set(Array(failedIDs).sorted(), forKey: Self.acknowledgedFailedPipelineIDsKey)
+    }
+
     func hasGitLabCredential(_ instance: GitLabInstance) -> Bool {
         gitLabCredentialHosts.contains(instance.host)
     }
@@ -564,6 +795,10 @@ final class StackHubStore: ObservableObject {
            let saved = try? JSONDecoder().decode([String: [Pipeline]].self, from: data) {
             pipelineCache = saved
         }
+        acknowledgedFailedPipelineIDs = Set(
+            defaults.stringArray(forKey: Self.acknowledgedFailedPipelineIDsKey) ?? []
+        )
+        reconcileAcknowledgedFailures()
         // Older indexes were persisted in arbitrary dictionary order. Rebuild
         // once so limited repository requests also keep the API's recent order.
         if defaults.integer(forKey: Self.projectIndexOrderVersionKey) == Self.projectIndexOrderVersion {
@@ -573,9 +808,22 @@ final class StackHubStore: ObservableObject {
         }
         lastGitHubRepositorySync = defaults.object(forKey: Self.githubRepositorySyncDateKey) as? Date
         lastGitHubFullDiscovery = defaults.object(forKey: Self.githubFullDiscoveryDateKey) as? Date
+        if let data = defaults.data(forKey: Self.gitLabPipelineSyncDateKey),
+           let saved = try? JSONDecoder().decode([String: Date].self, from: data) {
+            gitLabPipelineSyncDates = saved
+        }
+        if let data = defaults.data(forKey: Self.gitLabProjectPipelineSyncDateKey),
+           let saved = try? JSONDecoder().decode([String: Date].self, from: data) {
+            gitLabProjectPipelineSyncDates = saved
+        }
+        if let data = defaults.data(forKey: Self.gitLabGlobalPipelineCapabilityKey),
+           let saved = try? JSONDecoder().decode([String: Bool].self, from: data) {
+            gitLabGlobalPipelineCapabilities = saved
+        }
     }
 
     func persistCIState() {
+        reconcileAcknowledgedFailures()
         if let data = try? JSONEncoder().encode(projects) { defaults.set(data, forKey: "stackhub.local.projects") }
         if let data = try? JSONEncoder().encode(instances) { defaults.set(data, forKey: "stackhub.gitlab.instances") }
         if let data = try? JSONEncoder().encode(ciProjects) { defaults.set(data, forKey: "stackhub.ci.followed") }
@@ -584,6 +832,32 @@ final class StackHubStore: ObservableObject {
         defaults.set(lastCIProjectDiscovery, forKey: "stackhub.ci.discovery-date")
         defaults.set(lastGitHubRepositorySync, forKey: Self.githubRepositorySyncDateKey)
         defaults.set(lastGitHubFullDiscovery, forKey: Self.githubFullDiscoveryDateKey)
+        if let data = try? JSONEncoder().encode(gitLabPipelineSyncDates) {
+            defaults.set(data, forKey: Self.gitLabPipelineSyncDateKey)
+        }
+        if let data = try? JSONEncoder().encode(gitLabProjectPipelineSyncDates) {
+            defaults.set(data, forKey: Self.gitLabProjectPipelineSyncDateKey)
+        }
+        if let data = try? JSONEncoder().encode(gitLabGlobalPipelineCapabilities) {
+            defaults.set(data, forKey: Self.gitLabGlobalPipelineCapabilityKey)
+        }
+        defaults.set(Array(acknowledgedFailedPipelineIDs).sorted(), forKey: Self.acknowledgedFailedPipelineIDsKey)
+    }
+
+    private func reconcileAcknowledgedFailures() {
+        acknowledgedFailedPipelineIDs.formIntersection(
+            CIPipelineStatusCounter.failedPipelineIDs(in: pipelineCache)
+        )
+    }
+
+    private func clearGitLabRefreshState(for instanceID: UUID) {
+        let instanceKey = instanceID.uuidString
+        gitLabPipelineSyncDates.removeValue(forKey: instanceKey)
+        gitLabGlobalPipelineCapabilities.removeValue(forKey: instanceKey)
+        let projectKeyPrefix = "\(instanceKey):gitlab:\(instanceKey):"
+        gitLabProjectPipelineSyncDates = gitLabProjectPipelineSyncDates.filter {
+            !$0.key.hasPrefix(projectKeyPrefix)
+        }
     }
 
     func saveGitHubToken(_ token: String) {
@@ -687,15 +961,19 @@ final class StackHubStore: ObservableObject {
         isRefreshingCI = true
         ciError = nil
         let cachedProjects = accessibleCIProjects
-        let shouldDiscover = forceProjectDiscovery || cachedProjects.isEmpty || lastCIProjectDiscovery.map { Date().timeIntervalSince($0) > 600 } ?? true
-        Task { [weak self] in
+        Task { @MainActor [weak self] in
             guard let self else { return }
+            // Keep the visual refresh state recoverable even if a future
+            // early return or an unexpected thrown error bypasses the normal
+            // completion path below.
+            defer { self.isRefreshingCI = false }
             var projects: [CIAccessibleProject] = []
             var pipelines: [String: [Pipeline]] = self.pipelineCache
             var errors: [String] = []
             var didDiscover = false
             var didGitHubRepositorySync = false
             var didGitHubFullDiscovery = false
+            let profiler = CIRefreshProfiler()
 
                 if let token = await self.githubAccessTokenForRequest(), !token.isEmpty {
                     let cachedGitHubProjects = cachedProjects.filter { $0.provider == "GitHub Actions" && $0.isInRepositoryScope }
@@ -708,10 +986,12 @@ final class StackHubStore: ObservableObject {
                         // explicit force refresh bounded to the recent scope.
                         let fullDiscovery = forceProjectDiscovery || lastGitHubRepositorySync == nil || cachedGitHubProjects.isEmpty ||
                             lastGitHubFullDiscovery.map { Date().timeIntervalSince($0) > Self.githubFullDiscoveryInterval } ?? true
-                        let discovered = try await client.ownedProjects(
-                            limit: fullDiscovery ? Self.githubRepositoryLimit : 100,
-                            since: fullDiscovery ? nil : lastGitHubRepositorySync?.addingTimeInterval(-60)
-                        )
+                        let discovered = try await profiler.measure("GitHub · 仓库索引", requests: 1) {
+                            try await client.ownedProjects(
+                                limit: fullDiscovery ? Self.githubRepositoryLimit : 100,
+                                since: fullDiscovery ? nil : self.lastGitHubRepositorySync?.addingTimeInterval(-60)
+                            )
+                        }
                         let changed = discovered.map {
                             CIAccessibleProject(
                                 id: $0.id, name: $0.name, provider: $0.provider,
@@ -752,7 +1032,9 @@ final class StackHubStore: ObservableObject {
                                 let parts = project.repository.split(separator: "/", maxSplits: 1).map(String.init)
                                 guard parts.count == 2 else { continue }
                                 do {
-                                    let remote = try await client.recentRuns(owner: parts[0], repository: parts[1], projectID: project.id)
+                                    let remote = try await profiler.measure("GitHub · 流水线", requests: 1) {
+                                        try await client.recentRuns(owner: parts[0], repository: parts[1], projectID: project.id)
+                                    }
                                     let refreshed = remote.map(self.makePipeline)
                                     let previous = pipelines[project.id] ?? []
                                     pipelines[project.id] = refreshed.map { pipeline in
@@ -778,76 +1060,221 @@ final class StackHubStore: ObservableObject {
                     guard let token = self.gitLabToken(for: instance) else { continue }
                     do {
                         let client = try GitLabAPIClient(instanceURL: instance.host, token: token, projectIDPrefix: instance.id.uuidString)
-                        let mapped: [CIAccessibleProject]
-                        if shouldDiscover {
-                            let discovered = try await client.accessibleProjects()
-                            mapped = discovered.map { CIAccessibleProject(id: $0.id, name: $0.name, provider: $0.provider, repository: $0.repository, branch: $0.branch, instanceName: instance.name) }
-                            didDiscover = true
-                        } else {
-                            mapped = cachedProjects.filter { $0.provider == "GitLab CI" && $0.instanceName == instance.name }
+                        let syncKey = instance.id.uuidString
+                        let instanceProjectPrefix = "gitlab:\(syncKey):"
+                        var gitLabProjects = cachedProjects.filter {
+                            $0.provider == "GitLab CI" && $0.instanceName == instance.name
                         }
-                        projects.append(contentsOf: mapped)
-                        // One global request replaces N project-level pipeline
-                        // requests. The response carries project_id, so map it
-                        // back to the already indexed accessible projects.
-                        do {
-                            let remotePipelines: [RemotePipeline]
+                        var advancesPipelineCursor = false
+                        var remotePipelines: [RemotePipeline] = []
+
+                        if self.gitLabGlobalPipelineCapabilities[syncKey] != false {
                             do {
-                                remotePipelines = try await client.recentPipelines(limit: 100)
-                            } catch let CIIntegrationError.http(code, _) where code == 404 || code == 405 {
-                                // Older GitLab instances do not implement the
-                                // global feed. Query only the most recently
-                                // active projects, in small concurrent batches.
-                                let fallbackProjects = Array(mapped.prefix(GitLabAPIClient.legacyFallbackProjectLimit))
-                                var fallbackPipelines: [RemotePipeline] = []
-                                for start in stride(from: 0, to: fallbackProjects.count, by: 4) {
-                                    let end = min(start + 4, fallbackProjects.count)
-                                    let batch = Array(fallbackProjects[start..<end])
-                                    var fetched: [[RemotePipeline]] = []
-                                    for project in batch {
-                                        fetched.append((try? await client.recentPipelines(projectID: project.id, limit: 5)) ?? [])
-                                    }
-                                    fallbackPipelines.append(contentsOf: fetched.flatMap { $0 })
-                                }
-                                remotePipelines = fallbackPipelines
+                            // GitLab has a cross-project pipeline feed, so the
+                            // normal path starts here rather than enumerating
+                            // `/projects`. Its cursor is creation-based; a
+                            // short overlap handles requests at the boundary.
+                            let cursor = forceProjectDiscovery ? nil : self.gitLabPipelineSyncDates[syncKey]
+                            let createdAfter = cursor?.addingTimeInterval(-Self.gitLabPipelineSyncOverlap)
+                            remotePipelines = try await profiler.measure("\(instance.name) · 全局流水线", requests: 1) {
+                                try await client.recentPipelines(limit: 100, createdAfter: createdAfter)
                             }
-                            let projectsByID = Dictionary(uniqueKeysWithValues: mapped.map { ($0.id, $0) })
-                            let grouped = Dictionary(grouping: remotePipelines, by: \.projectID)
-                            for project in mapped {
-                                let latest = (grouped[project.id] ?? [])
-                                    .sorted { ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast) }
-                                    .prefix(5)
-                                let refreshed: [Pipeline] = latest.compactMap { remote in
-                                    guard let indexedProject = projectsByID[project.id] else { return nil }
-                                    return self.makePipeline(remote, project: indexedProject)
-                                }
-                                let previous = pipelines[project.id] ?? []
-                                pipelines[project.id] = refreshed.map { pipeline in
-                                    CIPipelineCache.merging(pipeline, with: previous.first { $0.id == pipeline.id })
-                                }
-                            }
-                            let stageCandidates = CIActivityOrdering.latestActivities(projects: mapped, pipelineCache: pipelines)
-                                .map { ($0.project.id, $0.pipeline) }
-                            let stageUpdates = await prefetchPipelineStages(candidates: stageCandidates, limit: Self.stagePrefetchProjectLimit) { pipeline in
+                            advancesPipelineCursor = true
+                            self.gitLabGlobalPipelineCapabilities[syncKey] = true
+
+                            // The global cursor only returns newly created
+                            // pipelines. Refresh cached running ones directly
+                            // so their final result still reaches the card.
+                            let runningCached = pipelines.values
+                                .flatMap { $0 }
+                                .filter { $0.provider == "GitLab CI" && $0.projectID.hasPrefix(instanceProjectPrefix) && $0.state == .running }
+                            for pipeline in runningCached {
                                 let pipelineID = pipeline.id.split(separator: "-").last.map(String.init) ?? pipeline.id
-                                return (try? await client.jobs(projectID: pipeline.projectID, pipelineID: pipelineID)) ?? []
+                                let refreshed = try? await profiler.measure("\(instance.name) · 运行中流水线", requests: 1) {
+                                    try await client.pipeline(projectID: pipeline.projectID, pipelineID: pipelineID)
+                                }
+                                if let refreshed {
+                                    remotePipelines.append(refreshed)
+                                }
                             }
-                            for (projectID, staged) in stageUpdates {
-                                let previous = pipelines[projectID]?.first { $0.id == staged.id }
-                                pipelines[projectID] = pipelines[projectID]?.map { $0.id == staged.id ? CIPipelineCache.merging(staged, with: previous) : $0 }
+                            } catch let CIIntegrationError.http(code, _) where code == 404 || code == 405 {
+                                // The authenticated probe confirms that this
+                                // instance is older than the cross-project API.
+                                // Persist it so later polls do not repeat 404.
+                                self.gitLabGlobalPipelineCapabilities[syncKey] = false
+                            } catch {
+                                throw error
                             }
-                        } catch {
-                            // Keep the project index visible even if a GitLab
-                            // instance temporarily rejects the global feed.
-                            errors.append("\(instance.name)：\(error.localizedDescription)")
                         }
-                    } catch { errors.append("\(instance.name)：\(error.localizedDescription)") }
+
+                        if self.gitLabGlobalPipelineCapabilities[syncKey] == false {
+                            // Old GitLab has no instance-wide activity feed.
+                            // Reuse its persisted project index; only a first
+                            // sync or an explicit discovery refresh enumerates
+                            // `/projects` again.
+                            if forceProjectDiscovery || gitLabProjects.isEmpty {
+                                let discovered = try await profiler.measure("\(instance.name) · 项目索引（兼容）", requests: 1) {
+                                    try await client.accessibleProjects()
+                                }
+                                gitLabProjects = discovered.map {
+                                    CIAccessibleProject(
+                                        id: $0.id, name: $0.name, provider: $0.provider,
+                                        repository: $0.repository, branch: $0.branch,
+                                        instanceName: instance.name
+                                    )
+                                }
+                                didDiscover = true
+                            }
+                            let fallbackProjects = Array(gitLabProjects.prefix(GitLabAPIClient.legacyFallbackProjectLimit))
+                            for project in fallbackProjects {
+                                let projectSyncKey = "\(syncKey):\(project.id)"
+                                let cachedCursor = pipelines[project.id]?.compactMap(\.updatedAt).max()
+                                let cursor = forceProjectDiscovery ? nil : (self.gitLabProjectPipelineSyncDates[projectSyncKey] ?? cachedCursor)
+                                let syncStartedAt = Date()
+                                do {
+                                    let projectPipelines = try await profiler.measure("\(instance.name) · 项目流水线（兼容）", requests: 1) {
+                                        try await client.recentPipelines(
+                                            projectID: project.id,
+                                            limit: cursor == nil ? 5 : 100,
+                                            updatedAfter: cursor
+                                        )
+                                    }
+                                    remotePipelines.append(contentsOf: projectPipelines)
+                                    // Advance only after a successful response;
+                                    // a failed request remains eligible next time.
+                                    self.gitLabProjectPipelineSyncDates[projectSyncKey] = syncStartedAt
+                                } catch {
+                                    errors.append("\(instance.name) \(project.repository)：\(error.localizedDescription)")
+                                }
+                            }
+                        }
+
+                        // A global response can contain the same running
+                        // pipeline as the direct refresh above. Let the direct
+                        // response win and never duplicate the card.
+                        var remotesByID: [String: RemotePipeline] = [:]
+                        for remote in remotePipelines {
+                            remotesByID["\(remote.projectID):\(remote.id)"] = remote
+                        }
+                        remotePipelines = Array(remotesByID.values)
+
+                        // New GitLab versions include `project` metadata in
+                        // the global feed. For older responses, resolve only
+                        // those individual unseen project IDs, never the full
+                        // project list.
+                        var projectsByID = Dictionary(uniqueKeysWithValues: gitLabProjects.map { ($0.id, $0) })
+                        var resolvedAllProjects = true
+                        for remote in remotePipelines where projectsByID[remote.projectID] == nil {
+                            if let project = self.makeGitLabProject(remote, instance: instance) {
+                                projectsByID[project.id] = project
+                            } else {
+                                do {
+                                    let resolved = try await profiler.measure("\(instance.name) · 项目元数据", requests: 1) {
+                                        try await client.project(projectID: remote.projectID)
+                                    }
+                                    projectsByID[remote.projectID] = CIAccessibleProject(
+                                        id: remote.projectID, name: resolved.name, provider: resolved.provider,
+                                        repository: resolved.repository, branch: resolved.branch,
+                                        instanceName: instance.name
+                                    )
+                                } catch {
+                                    resolvedAllProjects = false
+                                    errors.append("\(instance.name)：\(error.localizedDescription)")
+                                }
+                            }
+                        }
+
+                        var orderedProjectIDs: [String] = []
+                        for remote in remotePipelines where projectsByID[remote.projectID] != nil {
+                            if !orderedProjectIDs.contains(remote.projectID) { orderedProjectIDs.append(remote.projectID) }
+                        }
+                        for project in gitLabProjects where projectsByID[project.id] != nil {
+                            if !orderedProjectIDs.contains(project.id) { orderedProjectIDs.append(project.id) }
+                        }
+                        gitLabProjects = orderedProjectIDs.compactMap { projectsByID[$0] }
+                        projects.append(contentsOf: gitLabProjects)
+
+                        let cacheMergeStartedAt = Date()
+                        let grouped = Dictionary(grouping: remotePipelines, by: \.projectID)
+                        for (projectID, remotes) in grouped {
+                            guard let project = projectsByID[projectID] else { continue }
+                            let refreshed = remotes.map { self.makePipeline($0, project: project) }
+                            pipelines[projectID] = CIPipelineCache.mergingRecent(
+                                refreshed, with: pipelines[projectID] ?? []
+                            )
+                        }
+                        profiler.record("本地索引与缓存合并", duration: Date().timeIntervalSince(cacheMergeStartedAt))
+
+                        // GitLab's list endpoint omits duration and start time
+                        // on older instances. Fill those fields only for the
+                        // current completed pipeline of a followed project,
+                        // then retain the detail in the local cache. This is
+                        // at most one extra request per affected card, not a
+                        // history-wide re-query on every refresh.
+                        let followedProjectIDs = Set(self.ciProjects.compactMap { project in
+                            project.provider == "GitLab CI" && project.instanceName == instance.name ? project.id : nil
+                        })
+                        for projectID in followedProjectIDs {
+                            guard let project = projectsByID[projectID],
+                                  let latest = pipelines[projectID]?.sorted(by: CIActivityOrdering.newestFirst).first,
+                                  latest.duration == "—",
+                                  latest.state != .running else { continue }
+                            let pipelineID = latest.id.split(separator: "-").last.map(String.init) ?? latest.id
+                            let detailed = try? await profiler.measure("\(instance.name) · 关注流水线详情（耗时）", requests: 1) {
+                                try await client.pipeline(projectID: projectID, pipelineID: pipelineID)
+                            }
+                            guard let detailed else { continue }
+                            let refreshed = self.makePipeline(detailed, project: project)
+                            pipelines[projectID] = CIPipelineCache.mergingRecent(
+                                [refreshed], with: pipelines[projectID] ?? []
+                            )
+                        }
+
+                        // Re-fetch jobs only for a newly seen pipeline or one
+                        // still in flight. Completed, already-loaded jobs stay
+                        // in the local cache and add no request to this cycle.
+                        var stageCandidates: [(String, Pipeline)] = []
+                        var stageCandidateIDs = Set<String>()
+                        for remote in remotePipelines {
+                            guard let pipeline = pipelines[remote.projectID]?.first(where: { $0.id == remote.id }),
+                                  pipeline.state == .running || !pipeline.hasLoadedStages else { continue }
+                            let key = "\(remote.projectID):\(pipeline.id)"
+                            if stageCandidateIDs.insert(key).inserted {
+                                stageCandidates.append((remote.projectID, pipeline))
+                            }
+                        }
+                        let stageUpdates = await prefetchPipelineStages(
+                            candidates: stageCandidates,
+                            limit: Self.stagePrefetchProjectLimit
+                        ) { pipeline in
+                            let pipelineID = pipeline.id.split(separator: "-").last.map(String.init) ?? pipeline.id
+                            return await profiler.measure("\(instance.name) · 作业步骤", requests: 1) {
+                                (try? await client.jobs(projectID: pipeline.projectID, pipelineID: pipelineID)) ?? []
+                            }
+                        }
+                        for (projectID, staged) in stageUpdates {
+                            pipelines[projectID] = CIPipelineCache.mergingRecent(
+                                [staged], with: pipelines[projectID] ?? []
+                            )
+                        }
+                        if advancesPipelineCursor && resolvedAllProjects {
+                            self.gitLabPipelineSyncDates[syncKey] = Date()
+                        }
+                    } catch {
+                        // Keep locally discovered GitLab projects and cached
+                        // pipeline cards visible when a refresh fails.
+                        projects.append(contentsOf: cachedProjects.filter {
+                            $0.provider == "GitLab CI" && $0.instanceName == instance.name
+                        })
+                        errors.append("\(instance.name)：\(error.localizedDescription)")
+                    }
                 }
 
             let uniqueProjects = CIActivityOrdering.uniqueProjects(projects)
             let validIDs = Set(uniqueProjects.map(\.id))
             self.accessibleCIProjects = uniqueProjects
             self.pipelineCache = pipelines.filter { validIDs.contains($0.key) }
+            self.reconcileAcknowledgedFailures()
             if didDiscover {
                 self.lastCIProjectDiscovery = Date()
                 self.defaults.set(Self.projectIndexOrderVersion, forKey: Self.projectIndexOrderVersionKey)
@@ -855,10 +1282,18 @@ final class StackHubStore: ObservableObject {
             if didGitHubRepositorySync { self.lastGitHubRepositorySync = Date() }
             if didGitHubFullDiscovery { self.lastGitHubFullDiscovery = Date() }
             self.lastCIRefresh = Date()
+            let persistenceStartedAt = Date()
             self.persistCIState()
+            profiler.record("保存本地状态", duration: Date().timeIntervalSince(persistenceStartedAt))
             if !errors.isEmpty { self.ciError = errors.joined(separator: "\n") }
+            CIRefreshDiagnostics.write(
+                profiler.report(
+                    projectCount: uniqueProjects.count,
+                    pipelineCount: self.pipelineCache.values.reduce(0) { $0 + $1.count },
+                    errorCount: errors.count
+                )
+            )
             // 刷新结果由页面更新时间和列表表达，不再弹出项目数量提示。
-            self.isRefreshingCI = false
         }
     }
 
@@ -867,6 +1302,43 @@ final class StackHubStore: ObservableObject {
         let needsRefresh = accessibleCIProjects.isEmpty || lastCIRefresh.map { Date().timeIntervalSince($0) >= Self.ciRefreshInterval } ?? true
         guard needsRefresh else { return }
         refreshCI()
+    }
+
+    /// GitLab's collection endpoint intentionally omits execution timing on
+    /// some versions. Fetch details only when an activity card is actually
+    /// visible, then merge the result into the existing cache for later views.
+    func loadGitLabPipelineTimingIfNeeded(for pipeline: Pipeline) {
+        let hydrationID = "\(pipeline.projectID)|\(pipeline.id)"
+        guard pipeline.provider == "GitLab CI",
+              pipeline.duration == "—",
+              pipeline.state != .running,
+              let project = accessibleCIProjects.first(where: { $0.id == pipeline.projectID }),
+              let instance = instances.first(where: {
+                  pipeline.projectID.hasPrefix("gitlab:\($0.id.uuidString):")
+              }),
+              hydratingGitLabPipelineTimingIDs.insert(hydrationID).inserted else {
+            return
+        }
+
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.hydratingGitLabPipelineTimingIDs.remove(hydrationID) }
+            guard let token = self.gitLabToken(for: instance) else { return }
+            let pipelineID = pipeline.id.split(separator: "-").last.map(String.init) ?? pipeline.id
+            guard let client = try? GitLabAPIClient(
+                instanceURL: instance.host,
+                token: token,
+                projectIDPrefix: instance.id.uuidString
+            ), let detailed = try? await client.pipeline(projectID: pipeline.projectID, pipelineID: pipelineID) else {
+                return
+            }
+
+            let refreshed = self.makePipeline(detailed, project: project)
+            self.pipelineCache[pipeline.projectID] = CIPipelineCache.mergingRecent(
+                [refreshed], with: self.pipelineCache[pipeline.projectID] ?? []
+            )
+            self.persistCIState()
+        }
     }
 
     private func githubAccessTokenForRequest() async -> String? {
@@ -977,6 +1449,20 @@ final class StackHubStore: ObservableObject {
         )
     }
 
+    /// The cross-project GitLab response now carries `project.path_with_namespace`
+    /// on supported instances. Derive the small index entry from that payload
+    /// rather than making a separate repository-list request.
+    private func makeGitLabProject(_ remote: RemotePipeline, instance: GitLabInstance) -> CIAccessibleProject? {
+        let repository = remote.repository.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !repository.isEmpty else { return nil }
+        let name = repository.split(separator: "/").last.map(String.init) ?? repository
+        return CIAccessibleProject(
+            id: remote.projectID, name: name, provider: remote.provider,
+            repository: repository, branch: remote.branch.isEmpty ? "main" : remote.branch,
+            instanceName: instance.name
+        )
+    }
+
     /// 打开详情时只请求 jobs/stage 状态；点击具体阶段后才请求该阶段日志。
     func openPipeline(_ pipeline: Pipeline) {
         selectedPipeline = pipeline
@@ -1038,7 +1524,14 @@ final class StackHubStore: ObservableObject {
                 let update: (Pipeline) -> Pipeline = { current in
                     let stages = current.stages.map { currentStage in
                         guard currentStage.id == stage.id else { return currentStage }
-                        return PipelineStage(id: currentStage.id, name: currentStage.name, duration: currentStage.duration, state: currentStage.state, log: log)
+                        return PipelineStage(
+                            id: currentStage.id,
+                            name: currentStage.name,
+                            duration: currentStage.duration,
+                            state: currentStage.state,
+                            log: log,
+                            group: currentStage.group
+                        )
                     }
                     return Pipeline(
                         id: current.id,
@@ -1433,6 +1926,7 @@ final class StackHubStore: ObservableObject {
             KeychainVault.shared.delete(account: "gitlab:\(instance.host)")
             gitLabCredentialHosts.remove(instance.host)
             gitLabTokenCache.removeValue(forKey: instance.host)
+            clearGitLabRefreshState(for: instance.id)
         }
         if !trimmedToken.isEmpty {
             gitLabCredentialHosts.insert(resolvedHost)
@@ -1471,6 +1965,7 @@ final class StackHubStore: ObservableObject {
         KeychainVault.shared.delete(account: "gitlab:\(instance.host)")
         gitLabCredentialHosts.remove(instance.host)
         gitLabTokenCache.removeValue(forKey: instance.host)
+        clearGitLabRefreshState(for: instance.id)
         instances.removeAll { $0.id == instance.id }
         accessibleCIProjects.removeAll { $0.instanceName == instance.name }
         ciProjects.removeAll { $0.instanceName == instance.name }
@@ -1516,7 +2011,7 @@ struct StackHubPanel: View {
             .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
             .shadow(color: .black.opacity(0.52), radius: 28, y: 18)
 
-            PanelWindowTuner().frame(width: 0, height: 0)
+            PanelWindowTuner(height: $panelHeight).frame(width: 0, height: 0)
 
             if let toast = store.toast {
                 Text(L(toast))
@@ -1534,6 +2029,9 @@ struct StackHubPanel: View {
         .preferredColorScheme(.dark)
         .foregroundStyle(.white)
         .animation(.easeOut(duration: 0.18), value: store.toast)
+        .onChange(of: store.tab) { _, tab in
+            if tab == .ci { store.acknowledgeCIFailures() }
+        }
     }
 
     private var mainPanelContent: some View {
@@ -1552,7 +2050,7 @@ struct StackHubPanel: View {
                     .padding(.bottom, 16)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             } else {
-                ScrollView {
+                OverlayScrollView {
                     Group {
                         switch store.tab {
                         case .projects:
@@ -1569,19 +2067,7 @@ struct StackHubPanel: View {
                 .frame(maxHeight: .infinity)
             }
             HStack {
-                Button {
-                    NSApplication.shared.terminate(nil)
-                } label: {
-                    Image(systemName: "power")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 22, height: 22)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help(L("退出 StackHub"))
-                .accessibilityLabel(L("退出 StackHub"))
-                .keyboardShortcut("q", modifiers: .command)
+                QuitStackHubButton()
                 Spacer()
                 switch store.tab {
                 case .projects:
@@ -1674,6 +2160,32 @@ struct StackHubPanel: View {
     private func closeDestination() {
         settingsState.cancelEditor()
         withAnimation(.easeOut(duration: 0.18)) { selectedDestination = nil }
+    }
+}
+
+private struct QuitStackHubButton: View {
+    @State private var isHovering = false
+
+    var body: some View {
+        Button {
+            NSApplication.shared.terminate(nil)
+        } label: {
+            Image(systemName: "power")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(isHovering ? .red : .secondary)
+                .frame(width: 28, height: 28)
+                .contentShape(Rectangle())
+                .background(isHovering ? Color.red.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 7))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 7)
+                        .stroke(isHovering ? Color.red.opacity(0.2) : .clear)
+                }
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .help(L("退出 StackHub"))
+        .accessibilityLabel(L("退出 StackHub"))
+        .keyboardShortcut("q", modifiers: .command)
     }
 }
 
@@ -1940,7 +2452,7 @@ struct ProjectCard: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 11) {
+            HStack(spacing: 8) {
                 Button { store.toggle(project: project) } label: {
                     HStack(spacing: 11) {
                     Text(project.initial)
@@ -1959,22 +2471,11 @@ struct ProjectCard: View {
                     }
                     .frame(minWidth: 0, alignment: .leading)
                     Spacer(minLength: 8)
-                    if state == .issue {
-                        Circle()
-                            .fill(.yellow)
-                            .frame(width: 9, height: 9)
-                            .frame(width: 76, alignment: .trailing)
-                            .accessibilityLabel("服务警告")
-                            .help("服务出现警告，查看日志了解详情")
-                    } else {
-                        Label(state.label, systemImage: "circle.fill")
-                            .font(.caption2)
-                            .foregroundStyle(state.color)
-                            .labelStyle(.titleAndIcon)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.8)
-                            .frame(width: 76, alignment: .trailing)
-                    }
+                    Circle()
+                        .fill(state == .issue ? .yellow : state.color)
+                        .frame(width: 9, height: 9)
+                        .accessibilityLabel(state.label)
+                        .help(state == .issue ? "服务出现警告，查看日志了解详情" : state.label)
                     Image(systemName: "chevron.down")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -1984,13 +2485,15 @@ struct ProjectCard: View {
                 }
                 .buttonStyle(.plain)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                HoverIconButton(systemName: "pencil", help: "编辑项目", action: onEdit)
-                HoverIconButton(systemName: "trash", help: "移除项目", action: onDelete)
-                HoverIconButton(
-                    systemName: projectIsRunning ? "stop.fill" : "play.fill",
-                    help: projectIsRunning ? "停止" : "启动"
-                ) {
-                    store.projectAction(project, action: projectIsRunning ? "停止" : "启动")
+                HStack(spacing: 5) {
+                    HoverIconButton(systemName: "pencil", help: "编辑项目", action: onEdit)
+                    HoverIconButton(systemName: "trash", help: "移除项目", action: onDelete)
+                    HoverIconButton(
+                        systemName: projectIsRunning ? "stop.fill" : "play.fill",
+                        help: projectIsRunning ? "停止" : "启动"
+                    ) {
+                        store.projectAction(project, action: projectIsRunning ? "停止" : "启动")
+                    }
                 }
             }
             .padding(12)
@@ -2126,7 +2629,7 @@ struct ServiceLogDetailView: View {
             .padding(.vertical, 14)
             .overlay(alignment: .bottom) { Rectangle().fill(.white.opacity(0.08)).frame(height: 1) }
 
-            ScrollView(.vertical, showsIndicators: true) {
+            OverlayScrollView {
                 Text(displayedLog)
                     .font(.system(size: 11, design: .monospaced))
                     .textSelection(.enabled)
@@ -2184,7 +2687,7 @@ struct CIView: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 2)
-            VStack(spacing: 8) {
+            LazyVStack(spacing: 8) {
                 ForEach(store.recentCIActivities) { activity in
                     CIActivityRow(
                         project: activity.project,
@@ -2206,7 +2709,10 @@ struct CIView: View {
                 EmptyStateCard(icon: "arrow.down.circle", title: store.isGitHubConnected || !store.instances.isEmpty ? "正在同步流水线" : "先连接 CI 账号", detail: store.ciError ?? "打开 CI 页面后会自动加载你有权限查看的项目和流水线。")
             }
         }
-        .onAppear { store.refreshCIIfNeeded() }
+        .onAppear {
+            store.acknowledgeCIFailures()
+            store.refreshCIIfNeeded()
+        }
         .onReceive(refreshTimer) { _ in store.refreshCIIfNeeded() }
     }
 }
@@ -2267,6 +2773,7 @@ struct EmptyStateCard: View {
 }
 
 struct CIActivityRow: View {
+    @EnvironmentObject private var store: StackHubStore
     let project: CIAccessibleProject
     let pipeline: Pipeline
     let isFollowing: Bool
@@ -2300,12 +2807,12 @@ struct CIActivityRow: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 9) {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 8) {
                 Text(providerCode)
                     .font(.system(size: 10, weight: .bold))
-                    .frame(width: 28, height: 28)
-                    .background(Color.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+                    .frame(width: 26, height: 26)
+                    .background(Color.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
                 VStack(alignment: .leading, spacing: 2) {
                     Text("\(project.provider) · \(project.name)")
                         .font(.caption.weight(.semibold))
@@ -2324,34 +2831,35 @@ struct CIActivityRow: View {
                 }
             }
 
-            HStack(spacing: 8) {
+            HStack(spacing: 7) {
                 Text(L(pipeline.id.hasPrefix("github") ? "构建与测试" : "发布流水线"))
-                    .font(.subheadline.weight(.medium))
+                    .font(.caption.weight(.semibold))
                 CIStageProgress(stages: pipeline.stages, isLoaded: pipeline.hasLoadedStages, onStageTap: onStageTap)
-                Spacer(minLength: 4)
-                Text(pipeline.duration)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-
-            HStack(spacing: 8) {
+                Spacer(minLength: 2)
+                if pipeline.duration != "—" {
+                    Text(pipeline.duration)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
                 Button(action: onFollow) {
                     Image(systemName: isFollowing ? "star.fill" : "star")
-                        .frame(width: 24, height: 24)
+                        .frame(width: 20, height: 20)
                 }
                 .buttonStyle(CIFollowButtonStyle(isFollowing: isFollowing))
                 .accessibilityLabel(isFollowing ? "取消关注项目" : "关注项目")
                 .accessibilityHint("点击切换关注状态")
                 .help(isFollowing ? "取消关注项目" : "关注项目")
-                Button("查看流水线", action: onOpen)
+                Button(L("查看"), action: onOpen)
                     .buttonStyle(StackSecondaryButtonStyle())
                     .controlSize(.small)
-                Spacer()
+                    .help(L(pipeline.provider == "GitHub Actions" ? "查看运行" : "查看流水线"))
+                    .accessibilityLabel(L(pipeline.provider == "GitHub Actions" ? "查看运行" : "查看流水线"))
             }
         }
-        .padding(12)
-        .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14))
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(.white.opacity(0.075)))
+        .padding(10)
+        .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.075)))
+        .onAppear { store.loadGitLabPipelineTimingIfNeeded(for: pipeline) }
     }
 }
 
@@ -2383,12 +2891,12 @@ struct CIProjectCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Button(action: onToggle) {
-                HStack(spacing: 10) {
+                HStack(spacing: 8) {
                     Text(project.provider.hasPrefix("GitHub") ? "GH" : "GL")
                         .font(.caption.weight(.bold))
-                        .frame(width: 30, height: 30)
-                        .background(Color.white.opacity(0.13), in: RoundedRectangle(cornerRadius: 9))
-                    VStack(alignment: .leading, spacing: 3) {
+                        .frame(width: 28, height: 28)
+                        .background(Color.white.opacity(0.13), in: RoundedRectangle(cornerRadius: 8))
+                    VStack(alignment: .leading, spacing: 2) {
                         Text(project.name).font(.subheadline.weight(.semibold))
                         Text(project.provider + (project.instanceName.map { " · \($0)" } ?? ""))
                             .font(.caption2)
@@ -2402,9 +2910,11 @@ struct CIProjectCard: View {
                                 Circle().fill(latest.state.color).frame(width: 8, height: 8)
                                 Text(latest.state.label).font(.caption2.weight(.medium)).foregroundStyle(latest.state.color)
                             }
-                            Text(latest.executionDurationLabel)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                            if let duration = latest.executionDurationLabel {
+                                Text(duration)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
                         } else {
                             Text("尚无同步数据").font(.caption2).foregroundStyle(.secondary)
                         }
@@ -2420,7 +2930,7 @@ struct CIProjectCard: View {
             .buttonStyle(.plain)
 
             if let latest {
-                HStack(spacing: 8) {
+                HStack(spacing: 7) {
                     Text("最新流水线")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -2430,25 +2940,21 @@ struct CIProjectCard: View {
                         onStageTap: { stage in onStageTap(latest, stage) }
                     )
                     Spacer()
-                    VStack(alignment: .trailing, spacing: 2) {
-                        Text(latest.executionTimestampLabel)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                        Text(L(isExpanded ? "最近 5 条流水线" : "点击查看历史"))
-                            .font(.caption2)
-                            .foregroundStyle(.secondary.opacity(0.82))
-                    }
+                    Text(latest.executionTimestampLabel)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                .padding(.top, 10)
+                .padding(.top, 7)
             } else {
                 Text("刷新后显示最近流水线")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                    .padding(.top, 10)
+                    .padding(.top, 7)
             }
 
             if isExpanded && !runs.isEmpty {
-                Divider().padding(.vertical, 10)
+                Divider().padding(.vertical, 8)
                 VStack(spacing: 0) {
                     ForEach(Array(runs.prefix(5).enumerated()), id: \.element.id) { index, pipeline in
                         CIRunRow(
@@ -2461,7 +2967,7 @@ struct CIProjectCard: View {
                 }
             }
         }
-        .padding(13)
+        .padding(10)
         .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(isExpanded ? Color.purple.opacity(0.34) : Color.white.opacity(0.075)))
     }
@@ -2494,28 +3000,40 @@ struct CIStageProgress: View {
                         indicator(systemName: "ellipsis", color: .secondary)
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("流水线摘要，点击查看步骤")
+                    .accessibilityLabel(L("流水线摘要，点击查看步骤"))
                 } else {
                     indicator(systemName: "ellipsis", color: .secondary)
                 }
             } else {
-                ForEach(Array(stages.enumerated()), id: \.element.id) { index, stage in
-                    if index == stages.count - 1 && stages.count > 1 {
-                        Image(systemName: "arrow.right")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                    }
-                    if let onStageTap {
-                        Button { onStageTap(stage) } label: {
-                            indicator(color: stage.state.color)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("\(stage.name)，\(stage.state.label)，点击查看步骤")
-                    } else {
-                        indicator(color: stage.state.color)
-                    }
+                ForEach(stages.groupedPipelineStages) { stage in
+                    stageIndicator(stage)
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func stageIndicator(_ stage: PipelineStageGroup) -> some View {
+        let content = HStack(spacing: 3) {
+            indicator(color: stage.state.color)
+            if stage.jobs.count > 1 {
+                // This is not a separator between fixed dots. It appears only
+                // when a provider stage fans out into real child jobs.
+                Image(systemName: "arrow.turn.down.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Text("\(stage.jobs.count)")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+        }
+
+        if let onStageTap, let firstJob = stage.jobs.first {
+            Button { onStageTap(firstJob) } label: { content }
+                .buttonStyle(.plain)
+                .accessibilityLabel(LF("阶段 %@，%@，%ld 个作业，点击查看步骤", stage.name, stage.state.label, stage.jobs.count))
+        } else {
+            content
         }
     }
 
@@ -2706,6 +3224,7 @@ struct PipelineDetailView: View {
     let pipeline: Pipeline
     let onClose: () -> Void
     @State private var selectedStageID: String?
+    @State private var expandedStageGroupID: String?
 
     init(pipeline: Pipeline, onClose: @escaping () -> Void) {
         self.pipeline = pipeline
@@ -2713,6 +3232,7 @@ struct PipelineDetailView: View {
         // Opening a pipeline is intentionally a steps-only view. A stage is
         // selected only when the user clicks a stage chip in this detail view.
         _selectedStageID = State(initialValue: nil)
+        _expandedStageGroupID = State(initialValue: nil)
     }
 
     private var selectedStage: PipelineStage? {
@@ -2737,25 +3257,11 @@ struct PipelineDetailView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 15) {
             HStack { VStack(alignment: .leading, spacing: 4) { Text(L(pipeline.provider == "GitHub Actions" ? "构建与测试" : "发布流水线")).font(.headline); Text("\(pipeline.repository) / \(pipeline.branch)").font(.caption).foregroundStyle(.secondary) }; Spacer(); Button("返回", action: onClose).buttonStyle(StackSecondaryButtonStyle()) }
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(pipeline.stages) { stage in
-                        Button {
-                            selectedStageID = stage.id
-                            store.loadStageLog(for: pipeline, stage: stage)
-                        } label: {
-                            Label(stage.name, systemImage: stage.state == .failed ? "xmark.circle.fill" : "checkmark.circle.fill")
-                                .font(.caption)
-                                .foregroundStyle(selectedStage?.id == stage.id ? .white : stage.state.color)
-                                .padding(9)
-                                .background((selectedStage?.id == stage.id ? stage.state.color.opacity(0.22) : Color.white.opacity(0.05)), in: RoundedRectangle(cornerRadius: 9))
-                                .overlay(RoundedRectangle(cornerRadius: 9).stroke(selectedStage?.id == stage.id ? stage.state.color.opacity(0.5) : .clear))
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("\(stage.name)，点击查看日志")
-                    }
-                }
-            }
+            PipelineStageGroupList(
+                pipeline: pipeline,
+                selectedStageID: $selectedStageID,
+                expandedGroupID: $expandedStageGroupID
+            )
             if let selectedStage {
                 HStack {
                     Text("作业日志").font(.subheadline.weight(.semibold))
@@ -2765,7 +3271,7 @@ struct PipelineDetailView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
-                ScrollView(.vertical, showsIndicators: true) {
+                OverlayScrollView {
                     Text(displayedLog)
                         .font(.system(size: 11, design: .monospaced))
                         .textSelection(.enabled)
@@ -2830,6 +3336,110 @@ struct PipelineDetailView: View {
     private func openExternal() {
         guard let value = pipeline.webURL, let url = URL(string: value) else { return }
         NSWorkspace.shared.open(url)
+    }
+}
+
+private struct PipelineStageGroupList: View {
+    @EnvironmentObject private var store: StackHubStore
+    let pipeline: Pipeline
+    @Binding var selectedStageID: String?
+    @Binding var expandedGroupID: String?
+
+    private var groups: [PipelineStageGroup] { pipeline.stages.groupedPipelineStages }
+
+    var body: some View {
+        Group {
+            if !pipeline.hasLoadedStages {
+                HStack(spacing: 8) {
+                    CIStageProgress(stages: pipeline.stages, isLoaded: false)
+                    Text(L("正在加载步骤…"))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                OverlayScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(groups) { group in
+                            stageGroup(group)
+                        }
+                    }
+                    .padding(.trailing, 4)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: selectedStageID == nil ? 210 : 150, alignment: .topLeading)
+        .onAppear { selectFirstAvailableGroupIfNeeded() }
+        .onChange(of: groups.map(\.id)) { _, _ in selectFirstAvailableGroupIfNeeded() }
+    }
+
+    private func stageGroup(_ group: PipelineStageGroup) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Button {
+                withAnimation(.easeOut(duration: 0.16)) {
+                    expandedGroupID = expandedGroupID == group.id ? nil : group.id
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Circle().fill(group.state.color).frame(width: 9, height: 9)
+                    Text(LF("阶段：%@", group.name)).font(.subheadline.weight(.medium))
+                    Spacer()
+                    Text(LF("%ld 个作业", group.jobs.count))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Image(systemName: "chevron.down")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(expandedGroupID == group.id ? 180 : 0))
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(LF("阶段 %@，%ld 个作业", group.name, group.jobs.count))
+
+            if expandedGroupID == group.id {
+                VStack(spacing: 0) {
+                    ForEach(group.jobs) { job in
+                        Button {
+                            selectedStageID = job.id
+                            store.loadStageLog(for: pipeline, stage: job)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Circle().fill(job.state.color).frame(width: 7, height: 7)
+                                Text(job.name)
+                                    .font(.caption)
+                                    .lineLimit(1)
+                                Spacer()
+                                Text(job.duration)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                if selectedStageID == job.id {
+                                    Image(systemName: "checkmark")
+                                        .font(.caption2.weight(.bold))
+                                        .foregroundStyle(job.state.color)
+                                }
+                            }
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 7)
+                            .background(selectedStageID == job.id ? job.state.color.opacity(0.14) : .clear, in: RoundedRectangle(cornerRadius: 7))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(LF("作业 %@，%@，点击查看日志", job.name, job.state.label))
+                    }
+                }
+                .padding(.leading, 17)
+            }
+        }
+        .padding(10)
+        .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.07)))
+    }
+
+    private func selectFirstAvailableGroupIfNeeded() {
+        let groupIDs = Set(groups.map(\.id))
+        if let expandedGroupID, groupIDs.contains(expandedGroupID) { return }
+        expandedGroupID = groups.first?.id
     }
 }
 
