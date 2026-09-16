@@ -408,8 +408,7 @@ struct CIAccessibleProject: Identifiable, Codable {
     var repository: String
     var branch: String
     var instanceName: String?
-    // GitHub's repository `updated_at`, used as the incremental sync cursor.
-    // GitLab does not populate this field.
+    // GitHub's repository `updated_at` or GitLab's `last_activity_at`.
     var updatedAt: Date? = nil
     // Optional for decoding older indexes, which included collaborator/org
     // repositories and must be rediscovered before showing GitHub projects.
@@ -682,6 +681,7 @@ final class StackHubStore: ObservableObject {
     private var ciRefreshTasks: [CISource: Task<Void, Never>] = [:]
     private var ciSourceErrors: [CISource: String] = [:]
     private var offlineCISources: Set<CISource> = []
+    private var gitLabProjectPollAttempts: [String: Date] = [:]
 
     init(defaults: UserDefaults = .standard, ciSession: URLSession = CIHTTPTransport.session,
          ciCredentialProvider: CICredentialProvider? = nil, ciRefreshScheduler: CIRefreshScheduler? = nil) {
@@ -959,6 +959,9 @@ final class StackHubStore: ObservableObject {
         let projectKeyPrefix = "\(instanceKey):gitlab:\(instanceKey):"
         gitLabProjectPipelineSyncDates = gitLabProjectPipelineSyncDates.filter {
             !$0.key.hasPrefix(projectKeyPrefix)
+        }
+        gitLabProjectPollAttempts = gitLabProjectPollAttempts.filter {
+            !CISource.gitlab(instanceID).contains(projectID: $0.key)
         }
     }
 
@@ -1340,9 +1343,8 @@ final class StackHubStore: ObservableObject {
                         }
                     }
                 } catch let CIIntegrationError.http(code, _) where code == 404 || code == 405 {
-                    // The authenticated probe confirms that this
-                    // instance is older than the cross-project API.
-                    // Persist it so later polls do not repeat 404.
+                    // This endpoint is unavailable on this instance; a 404
+                    // does not identify its version. Keep project-level sync.
                     globalCapability = false
                 } catch {
                     throw error
@@ -1353,10 +1355,9 @@ final class StackHubStore: ObservableObject {
             self.gitLabGlobalPipelineCapabilities[syncKey] = globalCapability
 
             if globalCapability == false {
-                // Old GitLab has no instance-wide activity feed.
-                // Reuse its persisted project index; only a first
-                // sync or an explicit discovery refresh enumerates
-                // `/projects` again.
+                // Keep the full index, but refresh recent activity on every
+                // poll. Reusing its old order permanently hid projects beyond
+                // the first batch even after they received a new push.
                 if forceProjectDiscovery || gitLabProjects.isEmpty {
                     let discovered = try await profiler.measure("\(instance.name) · 项目索引（兼容）", requests: 1) {
                         try await client.accessibleProjects()
@@ -1365,20 +1366,58 @@ final class StackHubStore: ObservableObject {
                         CIAccessibleProject(
                             id: $0.id, name: $0.name, provider: $0.provider,
                             repository: $0.repository, branch: $0.branch,
-                            instanceName: instance.name, isCIEnabled: $0.isCIEnabled,
+                            instanceName: instance.name, updatedAt: $0.updatedAt, isCIEnabled: $0.isCIEnabled,
                             ciConfigurationCheckedAt: $0.isCIEnabled == nil ? nil : Date()
                         )
                     }
                     didDiscover = true
+                } else {
+                    do {
+                        let recent = try await profiler.measure("\(instance.name) · 最近项目活动", requests: 1) {
+                            try await client.recentlyActiveProjects()
+                        }
+                        let cachedByID = Dictionary(uniqueKeysWithValues: gitLabProjects.map { ($0.id, $0) })
+                        let refreshed = recent.map { remote in
+                            var project = cachedByID[remote.id] ?? CIAccessibleProject(
+                                id: remote.id, name: remote.name, provider: remote.provider,
+                                repository: remote.repository, branch: remote.branch, instanceName: instance.name
+                            )
+                            project.name = remote.name
+                            project.repository = remote.repository
+                            project.branch = remote.branch
+                            project.updatedAt = remote.updatedAt
+                            if let enabled = remote.isCIEnabled {
+                                project.isCIEnabled = enabled
+                                project.ciConfigurationCheckedAt = Date()
+                            }
+                            return project
+                        }
+                        gitLabProjects = CIActivityOrdering.uniqueProjects(refreshed + gitLabProjects)
+                    } catch {
+                        if CIConnectionFailure.shouldStopRequests(error) { throw error }
+                        errors.append("\(instance.name)：\(error.localizedDescription)")
+                    }
                 }
-                let fallbackProjects = Array(gitLabProjects.filter { project in
+                guard ciRefreshScheduler.isCurrent(source, requestID: requestID), !Task.isCancelled else { return }
+                projects = gitLabProjects
+                publishCIResult(source: source, requestID: requestID, projects: projects, pipelines: pipelines)
+                let eligibleProjects = gitLabProjects.filter { project in
                     if project.isCIEnabled == false, let checkedAt = project.ciConfigurationCheckedAt,
                        checkedAt >= syncStartedAt { return false }
                     return project.isCIEnabled != false || recheckDisabledProjects || forceProjectDiscovery ||
                         project.ciConfigurationCheckedAt.map { Date().timeIntervalSince($0) >= 300 } != false
-                }.prefix(GitLabAPIClient.legacyFallbackProjectLimit))
+                }
+                let successfulPolls = Dictionary(uniqueKeysWithValues: gitLabProjects.compactMap { project -> (String, Date)? in
+                    projectSyncDates["\(syncKey):\(project.id)"].map { (project.id, $0) }
+                })
+                let fallbackProjects = CIActivityOrdering.gitLabProjectsRequiringPipelineRefresh(
+                    projects: eligibleProjects, pipelineCache: pipelines,
+                    followedIDs: Set(ciProjects.map(\.id)), successfulPolls: successfulPolls,
+                    attemptedPolls: gitLabProjectPollAttempts, batchSize: GitLabAPIClient.legacyFallbackProjectLimit
+                )
                 for project in fallbackProjects {
                     try Task.checkCancellation()
+                    gitLabProjectPollAttempts[project.id] = Date()
                     if project.isCIEnabled == false {
                         do {
                             if try await refreshCIConfiguration(for: project) == false { continue }
@@ -1401,9 +1440,16 @@ final class StackHubStore: ObservableObject {
                             )
                         }
                         remotePipelines.append(contentsOf: projectPipelines)
+                        guard ciRefreshScheduler.isCurrent(source, requestID: requestID), !Task.isCancelled else { return }
+                        pipelines[project.id] = CIPipelineCache.mergingRecent(
+                            projectPipelines.map { self.makePipeline($0, project: project) },
+                            with: pipelines[project.id] ?? []
+                        )
+                        publishCIResult(source: source, requestID: requestID, projects: gitLabProjects, pipelines: pipelines)
                         // Advance only after a successful response;
                         // a failed request remains eligible next time.
                         projectSyncDates[projectSyncKey] = syncStartedAt
+                        self.gitLabProjectPipelineSyncDates[projectSyncKey] = syncStartedAt
                     } catch let error as CIIntegrationError {
                         if case .http(403, _) = error {
                             // Disabled CI/CD also returns 403. Confirm via project
@@ -1448,7 +1494,7 @@ final class StackHubStore: ObservableObject {
                         projectsByID[remote.projectID] = CIAccessibleProject(
                             id: remote.projectID, name: resolved.name, provider: resolved.provider,
                             repository: resolved.repository, branch: resolved.branch,
-                            instanceName: instance.name, isCIEnabled: resolved.isCIEnabled,
+                            instanceName: instance.name, updatedAt: resolved.updatedAt, isCIEnabled: resolved.isCIEnabled,
                             ciConfigurationCheckedAt: resolved.isCIEnabled == nil ? nil : Date()
                         )
                     } catch {

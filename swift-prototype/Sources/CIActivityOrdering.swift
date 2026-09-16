@@ -83,4 +83,37 @@ enum CIActivityOrdering {
         })
         return projects.filter { runningIDs.contains($0.id) } + projects.filter { !runningIDs.contains($0.id) }
     }
+
+    /// The first batch follows fresh server activity. Followed/running projects
+    /// and activity newer than the last successful poll must not be cut off by
+    /// that batch size. Rotate through the rest to catch retries and schedules
+    /// that do not update GitLab's project activity timestamp.
+    static func gitLabProjectsRequiringPipelineRefresh(
+        projects: [CIAccessibleProject],
+        pipelineCache: [String: [Pipeline]],
+        followedIDs: Set<String>,
+        successfulPolls: [String: Date],
+        attemptedPolls: [String: Date],
+        batchSize: Int
+    ) -> [CIAccessibleProject] {
+        let projects = uniqueProjects(projects)
+        let recent = Array(projects.prefix(max(0, batchSize)))
+        let urgent = projects.filter { project in
+            followedIDs.contains(project.id) ||
+                pipelineCache[project.id]?.contains { $0.state == .running } == true ||
+                project.updatedAt.map { $0 > (successfulPolls[project.id] ?? .distantPast) } == true
+        }
+        let priority = uniqueProjects(recent + urgent)
+        let priorityIDs = Set(priority.map(\.id))
+        let background = projects.enumerated()
+            .filter { !priorityIDs.contains($0.element.id) }
+            .sorted { lhs, rhs in
+                let left = attemptedPolls[lhs.element.id] ?? successfulPolls[lhs.element.id] ?? .distantPast
+                let right = attemptedPolls[rhs.element.id] ?? successfulPolls[rhs.element.id] ?? .distantPast
+                return left == right ? lhs.offset < rhs.offset : left < right
+            }
+            .prefix(max(0, batchSize))
+            .map(\.element)
+        return priority + background
+    }
 }

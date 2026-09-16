@@ -3,6 +3,24 @@ import XCTest
 @testable import StackHub
 
 final class CIActivityOrderingTests: XCTestCase {
+    func testGitLabNewActivityFollowedAndRunningProjectsAreNotCutOffByBatchLimit() {
+        let projects = (1...30).map { project("gitlab:one:\($0)", provider: "GitLab CI", timestamp: 200) }
+        var successes = Dictionary(uniqueKeysWithValues: projects.map { ($0.id, Date(timeIntervalSince1970: 300)) })
+        // More than eight repositories changed since their previous poll.
+        for repository in projects[8..<20] { successes[repository.id] = Date(timeIntervalSince1970: 100) }
+        let running = projects[28]
+        let result = CIActivityOrdering.gitLabProjectsRequiringPipelineRefresh(
+            projects: projects,
+            pipelineCache: [running.id: [pipeline("run", project: running, timestamp: 300, state: .running)]],
+            followedIDs: [projects[29].id], successfulPolls: successes, attemptedPolls: [:], batchSize: 8
+        )
+        let ids = Set(result.map(\.id))
+        XCTAssertTrue(Set(projects[8..<20].map(\.id)).isSubset(of: ids))
+        XCTAssertTrue(ids.contains(running.id))
+        XCTAssertTrue(ids.contains(projects[29].id))
+        XCTAssertEqual(result.count, ids.count, "Each project is only requested once per cycle")
+    }
+
     func testExecutionDurationFormattingIsCompactAndProviderIndependent() {
         withAppLanguage(.simplifiedChinese) {
         XCTAssertEqual(CIExecutionTimeFormatter.duration(seconds: 0), "0 秒")

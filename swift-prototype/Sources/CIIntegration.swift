@@ -358,8 +358,8 @@ private struct GitHubJob: Decodable {
 // MARK: - GitLab REST
 
 final class GitLabAPIClient {
-    /// Older/self-managed GitLab versions may not expose the cross-project
-    /// `/pipelines` endpoint. Keep the compatibility fallback bounded.
+    /// Bound the regular and background polling batches when the instance
+    /// does not expose `/pipelines` (including GitLab 19.3.2).
     static let legacyFallbackProjectLimit = 8
 
     private let baseURL: URL
@@ -413,12 +413,28 @@ final class GitLabAPIClient {
                 URLQueryItem(name: "membership", value: "true"),
                 URLQueryItem(name: "per_page", value: "100"),
                 URLQueryItem(name: "page", value: "\(page)"),
-                URLQueryItem(name: "order_by", value: "last_activity_at")
+                URLQueryItem(name: "order_by", value: "last_activity_at"),
+                URLQueryItem(name: "sort", value: "desc")
             ])
             let batch: [GitLabProject] = try await send(url)
             response.append(contentsOf: batch)
             if batch.count < 100 { break }
         }
+        let prefix = projectIDPrefix ?? baseURL.host ?? "instance"
+        return response.map { makeRemoteProject($0, prefix: prefix) }
+    }
+
+    /// Refresh the activity ordering with one request on every compatibility
+    /// poll. A persisted index alone cannot discover pushes to older projects.
+    func recentlyActiveProjects() async throws -> [RemoteProject] {
+        let url = try makeURL(path: "/api/v4/projects", query: [
+            URLQueryItem(name: "membership", value: "true"),
+            URLQueryItem(name: "per_page", value: "100"),
+            URLQueryItem(name: "page", value: "1"),
+            URLQueryItem(name: "order_by", value: "last_activity_at"),
+            URLQueryItem(name: "sort", value: "desc")
+        ])
+        let response: [GitLabProject] = try await send(url)
         let prefix = projectIDPrefix ?? baseURL.host ?? "instance"
         return response.map { makeRemoteProject($0, prefix: prefix) }
     }
@@ -520,7 +536,7 @@ final class GitLabAPIClient {
         RemoteProject(
             id: "gitlab:\(prefix):\(project.id)", name: project.name,
             repository: project.pathWithNamespace, branch: project.defaultBranch ?? "main",
-            provider: "GitLab CI", instanceName: baseURL.host, updatedAt: nil,
+            provider: "GitLab CI", instanceName: baseURL.host, updatedAt: project.lastActivityAt,
             isCIEnabled: project.isCIEnabled
         )
     }
@@ -552,6 +568,7 @@ private struct GitLabProject: Decodable {
     let defaultBranch: String?
     let buildsAccessLevel: String?
     let jobsEnabled: Bool?
+    let lastActivityAt: Date?
 
     var isCIEnabled: Bool? {
         if buildsAccessLevel == "disabled" || jobsEnabled == false { return false }
@@ -565,6 +582,7 @@ private struct GitLabProject: Decodable {
         case defaultBranch = "default_branch"
         case buildsAccessLevel = "builds_access_level"
         case jobsEnabled = "jobs_enabled"
+        case lastActivityAt = "last_activity_at"
     }
 }
 

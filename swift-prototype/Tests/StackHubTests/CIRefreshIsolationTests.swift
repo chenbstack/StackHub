@@ -68,7 +68,7 @@ final class CIRefreshIsolationTests: XCTestCase {
 
         fixture.store.refreshCI()
         try await eventually { !fixture.store.isRefreshingCI }
-        XCTAssertEqual(fixture.router.count(host: "office.test"), 2, "One capability probe and one failed project request")
+        XCTAssertEqual(fixture.router.count(host: "office.test"), 2, "One capability probe and one failed activity-index request")
         XCTAssertEqual(fixture.store.pipelineCache.count, 8)
         XCTAssertEqual(fixture.store.pipelineCache.values.flatMap { $0 }.map(\.id), Array(repeating: "cached", count: 8))
         let cursors = fixture.defaults.data(forKey: "stackhub.ci.gitlab-project-pipeline-sync-dates")
@@ -80,13 +80,87 @@ final class CIRefreshIsolationTests: XCTestCase {
         XCTAssertEqual(fixture.router.count(host: "office.test"), 2, "Automatic refresh respects this instance's cooldown")
 
         fixture.router.respond { request in
-            request.url!.path.hasSuffix("/jobs") ? .json("[]") : .json(self.pipelineJSON())
+            if request.url!.path == "/api/v4/projects" { return .json("[]") }
+            return request.url!.path.hasSuffix("/jobs") ? .json("[]") : .json(self.pipelineJSON())
         }
         fixture.store.refreshCI()
         try await eventually { !fixture.store.isRefreshingCI }
         XCTAssertNil(fixture.store.ciError)
         XCTAssertTrue(fixture.store.pipelineCache.values.flatMap { $0 }.contains { $0.id == "gitlab-1" })
         XCTAssertEqual(fixture.router.requests.filter { $0.url!.path == "/api/v4/pipelines" }.count, 1, "Keep the confirmed legacy capability across offline attempts")
+    }
+
+    @MainActor
+    func testLegacyRefreshFindsCEBeyondCachedPrefixBeforeAnotherProjectTimesOut() async throws {
+        let online = instance("online")
+        let fixture = makeFixture(instances: [online])
+        defer { fixture.cleanUp() }
+        let cached = (1...12).map { cachedProject(online, number: $0) }
+        fixture.store.accessibleCIProjects = cached
+        fixture.store.pipelineCache[cached[11].id] = [cachedPipeline(cached[11])]
+        fixture.router.respond { request in
+            switch request.url!.path {
+            case "/api/v4/pipelines": return .http(404)
+            case "/api/v4/projects":
+                // EE was first in the old index; CE was tenth. The server
+                // now reports both as active, and omits an older cached item.
+                return .json(self.gitLabProjectListJSON([1, 10] + Array(2...9) + [11], activity: "2026-09-16T04:15:00.000Z"))
+            case "/api/v4/projects/1/pipelines": return .json(self.gitLabPipelineJSON(project: 1, run: 5561))
+            case "/api/v4/projects/10/pipelines": return .json(self.gitLabPipelineJSON(project: 10, run: 5560))
+            case "/api/v4/projects/2/pipelines": return .hold
+            default: return .json("[]")
+            }
+        }
+
+        fixture.store.refreshCI()
+        try await eventually {
+            fixture.store.pipelineCache[cached[0].id]?.first?.id == "gitlab-5561" &&
+            fixture.store.pipelineCache[cached[9].id]?.first?.id == "gitlab-5560" &&
+            fixture.router.requests.contains { $0.url!.path == "/api/v4/projects/2/pipelines" }
+        }
+        XCTAssertTrue(fixture.store.isRefreshingCI, "CE and EE are visible while another request is still pending")
+        XCTAssertTrue(Set(fixture.store.recentCIActivities.map(\.id)).isSuperset(of: [cached[0].id, cached[9].id]))
+        XCTAssertNotNil(fixture.store.accessibleCIProjects.first { $0.id == cached[9].id }?.updatedAt)
+        XCTAssertEqual(fixture.store.pipelineCache[cached[11].id]?.first?.id, "cached", "A partial activity list must retain older cached projects")
+        let indexURL = try XCTUnwrap(fixture.router.requests.first { $0.url!.path == "/api/v4/projects" }?.url)
+        let query = URLComponents(url: indexURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        XCTAssertTrue(query.contains { $0.name == "order_by" && $0.value == "last_activity_at" })
+        XCTAssertTrue(query.contains { $0.name == "sort" && $0.value == "desc" })
+
+        fixture.router.releaseHeld(host: "online.test", result: .failure(.timedOut))
+        try await eventually { !fixture.store.isRefreshingCI }
+        XCTAssertFalse(fixture.router.requests.contains { $0.url!.path == "/api/v4/projects/3/pipelines" }, "Stop after the first network failure")
+        let restored = StackHubStore(defaults: fixture.defaults)
+        XCTAssertEqual(restored.pipelineCache[cached[9].id]?.first?.id, "gitlab-5560")
+        let cursors = try JSONDecoder().decode([String: Date].self, from: XCTUnwrap(fixture.defaults.data(forKey: "stackhub.ci.gitlab-project-pipeline-sync-dates")))
+        XCTAssertNotNil(cursors["\(online.id.uuidString):\(cached[9].id)"])
+        XCTAssertNil(cursors["\(online.id.uuidString):\(cached[1].id)"])
+    }
+
+    @MainActor
+    func testLegacyPollingRotatesBeyondFirstBatchEvenWhenAProjectDeniesAccess() async throws {
+        let online = instance("online")
+        let fixture = makeFixture(instances: [online])
+        defer { fixture.cleanUp() }
+        fixture.store.accessibleCIProjects = (1...26).map { cachedProject(online, number: $0) }
+        fixture.router.respond { request in
+            switch request.url!.path {
+            case "/api/v4/pipelines": return .http(404)
+            case "/api/v4/projects": return .json(self.gitLabProjectListJSON(Array(1...26)))
+            case "/api/v4/projects/9/pipelines", "/api/v4/projects/9": return .http(403)
+            default: return .json("[]")
+            }
+        }
+        for _ in 0..<3 {
+            fixture.store.refreshCI()
+            try await eventually { !fixture.store.isRefreshingCI }
+        }
+        let paths = Set(fixture.router.requests.map { $0.url!.path })
+        for id in 1...26 {
+            XCTAssertTrue(paths.contains("/api/v4/projects/\(id)/pipelines"), "Project \(id) must eventually be polled")
+        }
+        XCTAssertEqual(fixture.router.requests.filter { $0.url!.path == "/api/v4/projects" }.count, 3)
+        XCTAssertTrue(fixture.store.ciError == nil || fixture.store.ciError!.contains("403"))
     }
 
     @MainActor
@@ -425,6 +499,7 @@ final class CIRefreshIsolationTests: XCTestCase {
         fixture.router.respond { request in
             switch request.url!.path {
             case "/api/v4/pipelines": return .http(404)
+            case "/api/v4/projects": return .json("[]")
             case "/api/v4/projects/1/pipelines": return .http(403)
             case "/api/v4/projects/1": return .json(self.gitLabProjectJSON(ciEnabled: false))
             default: return .http(500)
@@ -441,9 +516,10 @@ final class CIRefreshIsolationTests: XCTestCase {
         now.addTimeInterval(31)
         fixture.store.refreshCIIfNeeded()
         try await eventually { !fixture.store.isRefreshingCI }
-        XCTAssertEqual(fixture.router.requests.count, requestCount, "Skip known disabled CI, including cached jobs")
+        XCTAssertEqual(fixture.router.requests.count, requestCount + 1, "Refresh the activity index but skip known disabled pipelines and jobs")
 
         fixture.router.respond { request in
+            if request.url!.path == "/api/v4/projects" { return .json("[]") }
             if request.url!.path == "/api/v4/projects/1" { return .json(self.gitLabProjectJSON(ciEnabled: true)) }
             return .json(request.url!.path.hasSuffix("/jobs") ? "[]" : self.pipelineJSON())
         }
@@ -479,6 +555,7 @@ final class CIRefreshIsolationTests: XCTestCase {
         fixture.store.accessibleCIProjects = [cachedProject(online, number: 1)]
         fixture.router.respond { request in
             if request.url!.path == "/api/v4/pipelines" { return .http(404) }
+            if request.url!.path == "/api/v4/projects" { return .json("[]") }
             if request.url!.path == "/api/v4/projects/1" { return .json(self.gitLabProjectJSON(ciEnabled: true)) }
             return .http(403)
         }
@@ -684,6 +761,17 @@ final class CIRefreshIsolationTests: XCTestCase {
             {"id":\(run),"project_id":\(project),"status":"success","ref":"main","sha":"abcdef123","duration":2,"updated_at":"2026-09-15T10:00:0\(run)Z","project":{"name":"Project \(project)","path_with_namespace":"team/project\(project)"}}
             """
         }.joined(separator: ",") + "]"
+    }
+
+    private func gitLabProjectListJSON(_ ids: [Int], activity: String? = nil) -> String {
+        "[" + ids.map { id in
+            let timestamp = activity.map { ",\"last_activity_at\":\"\($0)\"" } ?? ""
+            return "{\"id\":\(id),\"name\":\"Project \(id)\",\"path_with_namespace\":\"team/project\(id)\",\"default_branch\":\"main\"\(timestamp)}"
+        }.joined(separator: ",") + "]"
+    }
+
+    private func gitLabPipelineJSON(project: Int, run: Int) -> String {
+        "[{\"id\":\(run),\"project_id\":\(project),\"status\":\"running\",\"ref\":\"v0.39.0\",\"sha\":\"abcdef123\",\"updated_at\":\"2026-09-16T04:15:05.882Z\"}]"
     }
 
     @MainActor
