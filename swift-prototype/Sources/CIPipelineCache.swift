@@ -6,9 +6,9 @@ enum CIPipelineCache {
     static func stageRefreshCandidates(in cache: [String: [Pipeline]]) -> [(String, Pipeline)] {
         cache.compactMap { projectID, runs in
             guard let latest = runs.sorted(by: CIActivityOrdering.newestFirst).first,
-                  !latest.hasLoadedStages || latest.state == .running ||
+                  !latest.hasLoadedStages || latest.state.needsStatusRefresh ||
                     latest.stageSnapshotState.map({ $0 != latest.state }) == true ||
-                    latest.stages.contains(where: { $0.state == .running }) else { return nil }
+                    latest.stages.contains(where: { $0.state.isInProgress || $0.rawStatus == nil }) else { return nil }
             return (projectID, latest)
         }
     }
@@ -49,7 +49,9 @@ enum CIPipelineCache {
                 duration: stage.duration,
                 state: stage.state,
                 log: old.log,
-                group: stage.group
+                group: stage.group,
+                rawStatus: stage.rawStatus,
+                groupOrder: stage.groupOrder
             )
         }
         return copy(refreshed, stages: stages, hasLoadedStages: true,
@@ -65,7 +67,9 @@ enum CIPipelineCache {
                 duration: job.duration,
                 state: job.state,
                 log: "",
-                group: job.stage.isEmpty ? nil : job.stage
+                group: job.stage.isEmpty ? nil : job.stage,
+                rawStatus: job.status,
+                groupOrder: job.stageOrder
             )
         }
         return copy(pipeline, stages: stages, hasLoadedStages: true, stageSnapshotState: pipeline.state)

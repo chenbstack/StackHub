@@ -427,24 +427,6 @@ struct CIAccessibleProject: Identifiable, Codable {
     }
 }
 
-enum PipelineState: String, Codable {
-    case success, failed, running
-    var color: Color {
-        switch self {
-        case .success: return .green
-        case .failed: return .red
-        case .running: return .blue
-        }
-    }
-    var label: String {
-        switch self {
-        case .success: return L("成功")
-        case .failed: return L("失败")
-        case .running: return L("运行中")
-        }
-    }
-}
-
 struct PipelineStage: Identifiable, Codable {
     let id: String
     let name: String
@@ -455,6 +437,8 @@ struct PipelineStage: Identifiable, Codable {
     /// a named stage, which lets the UI present one stage with dynamic jobs
     /// underneath instead of treating every job as a linear pipeline step.
     let group: String?
+    let rawStatus: String?
+    let groupOrder: Int?
 
     init(
         id: String,
@@ -462,7 +446,9 @@ struct PipelineStage: Identifiable, Codable {
         duration: String,
         state: PipelineState,
         log: String,
-        group: String? = nil
+        group: String? = nil,
+        rawStatus: String? = nil,
+        groupOrder: Int? = nil
     ) {
         self.id = id
         self.name = name
@@ -470,6 +456,8 @@ struct PipelineStage: Identifiable, Codable {
         self.state = state
         self.log = log
         self.group = group
+        self.rawStatus = rawStatus
+        self.groupOrder = groupOrder
     }
 }
 
@@ -479,9 +467,7 @@ struct PipelineStageGroup: Identifiable {
     let jobs: [PipelineStage]
 
     var state: PipelineState {
-        if jobs.contains(where: { $0.state == .failed }) { return .failed }
-        if jobs.contains(where: { $0.state == .running }) { return .running }
-        return .success
+        PipelineState.aggregate(jobs.map(\.state))
     }
 }
 
@@ -493,7 +479,11 @@ extension Array where Element == PipelineStage {
         var names: [String] = []
         var jobsByName: [String: [PipelineStage]] = [:]
 
-        for job in self {
+        let ordered = enumerated().sorted {
+            let left = $0.element.groupOrder ?? Int.max, right = $1.element.groupOrder ?? Int.max
+            return left == right ? $0.offset < $1.offset : left < right
+        }.map(\.element)
+        for job in ordered {
             let normalizedGroup = job.group?.trimmingCharacters(in: .whitespacesAndNewlines)
             let name = normalizedGroup.flatMap { $0.isEmpty ? nil : $0 } ?? job.name
             if jobsByName[name] == nil { names.append(name) }
@@ -1348,7 +1338,7 @@ final class StackHubStore: ObservableObject {
                     // so their final result still reaches the card.
                     let runningCached = pipelines.values
                         .flatMap { $0 }
-                        .filter { $0.provider == "GitLab CI" && $0.projectID.hasPrefix(instanceProjectPrefix) && $0.state == .running }
+                        .filter { $0.provider == "GitLab CI" && $0.projectID.hasPrefix(instanceProjectPrefix) && $0.state.needsStatusRefresh }
                     let runningToRefresh = runningCached.filter { pipeline in
                         gitLabProjects.first(where: { $0.id == pipeline.projectID })?.isCIEnabled != false
                     }.sorted { lhs, rhs in
@@ -1590,7 +1580,7 @@ final class StackHubStore: ObservableObject {
                       project.isCIEnabled != false,
                       let latest = pipelines[projectID]?.sorted(by: CIActivityOrdering.newestFirst).first,
                       latest.duration == "—",
-                      latest.state != .running else { continue }
+                      !latest.state.needsStatusRefresh else { continue }
                 guard timingRequests < Self.timingPrefetchProjectLimit else { break }
                 timingRequests += 1
                 gitLabTimingPollAttempts[projectID] = Date()
@@ -1626,7 +1616,7 @@ final class StackHubStore: ObservableObject {
                 let pipelineID = pipeline.id.split(separator: "-").last.map(String.init) ?? pipeline.id
                 return try await optionalCIRequest {
                     try await profiler.measure("\(instance.name) · 作业步骤", requests: 1) {
-                        try await client.jobs(projectID: pipeline.projectID, pipelineID: pipelineID)
+                        try await client.jobs(projectID: pipeline.projectID, pipelineID: pipelineID, repository: pipeline.repository)
                     }
                 } ?? []
             }
@@ -1659,7 +1649,7 @@ final class StackHubStore: ObservableObject {
         let hydrationID = "\(pipeline.projectID)|\(pipeline.id)"
         guard pipeline.provider == "GitLab CI",
               pipeline.duration == "—",
-              pipeline.state != .running,
+              !pipeline.state.needsStatusRefresh,
               let project = accessibleCIProjects.first(where: { $0.id == pipeline.projectID }),
               project.isCIEnabled != false,
               let instance = instances.first(where: {
@@ -1835,7 +1825,7 @@ final class StackHubStore: ObservableObject {
                           let instance = instances.first(where: { $0.name == project.instanceName }),
                           let token = gitLabToken(for: instance) else { throw CIIntegrationError.missingToken }
                     let pipelineID = pipeline.id.split(separator: "-").last.map(String.init) ?? pipeline.id
-                    jobs = try await GitLabAPIClient(instanceURL: instance.host, token: token, session: ciSession).jobs(projectID: project.id, pipelineID: pipelineID)
+                    jobs = try await GitLabAPIClient(instanceURL: instance.host, token: token, session: ciSession).jobs(projectID: project.id, pipelineID: pipelineID, repository: pipeline.repository)
                 }
 
                 // Jobs may return after the summary refresh has completed.
@@ -1891,7 +1881,9 @@ final class StackHubStore: ObservableObject {
                             duration: currentStage.duration,
                             state: currentStage.state,
                             log: log,
-                            group: currentStage.group
+                            group: currentStage.group,
+                            rawStatus: currentStage.rawStatus,
+                            groupOrder: currentStage.groupOrder
                         )
                     }
                     return Pipeline(
@@ -3256,7 +3248,7 @@ struct CIActivityRow: View {
                     Text("\(project.provider) · \(project.name)")
                         .font(.caption.weight(.semibold))
                         .lineLimit(1)
-                    Text("\(project.repository) / \(project.branch) · \(timeLabel)")
+                    Text("\(pipeline.repository) / \(pipeline.branch.isEmpty ? project.branch : pipeline.branch) · \(timeLabel)")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -3432,8 +3424,8 @@ struct CIStageProgress: View {
     }
 
     var body: some View {
-        HStack(spacing: 7) {
-            if !isLoaded {
+        if !isLoaded {
+            HStack(spacing: 7) {
                 if let summary = stages.first, let onStageTap {
                     Button { onStageTap(summary) } label: {
                         indicator(systemName: "ellipsis", color: .secondary)
@@ -3443,37 +3435,45 @@ struct CIStageProgress: View {
                 } else {
                     indicator(systemName: "ellipsis", color: .secondary)
                 }
-            } else {
-                ForEach(stages.groupedPipelineStages) { stage in
-                    stageIndicator(stage)
+            }
+        } else {
+            ViewThatFits(in: .horizontal) {
+                jobIndicators.fixedSize(horizontal: true, vertical: false)
+                ScrollView(.horizontal) {
+                    jobIndicators
+                }
+                .scrollIndicators(.hidden)
+                .frame(height: 15)
+            }
+        }
+    }
+
+    private var jobIndicators: some View {
+        HStack(spacing: 7) {
+            ForEach(stages.groupedPipelineStages) { stage in
+                HStack(spacing: 3) {
+                    ForEach(stage.jobs) { job in
+                        jobIndicator(job)
+                    }
                 }
             }
         }
     }
 
-    @ViewBuilder
-    private func stageIndicator(_ stage: PipelineStageGroup) -> some View {
-        let content = HStack(spacing: 3) {
-            indicator(color: stage.state.color)
-            if stage.jobs.count > 1 {
-                // This is not a separator between fixed dots. It appears only
-                // when a provider stage fans out into real child jobs.
-                Image(systemName: "arrow.turn.down.right")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                Text("\(stage.jobs.count)")
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(.secondary)
+    private func jobIndicator(_ job: PipelineStage) -> some View {
+        Group {
+            if let onStageTap {
+                Button { onStageTap(job) } label: {
+                    indicator(color: job.state.color)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(LF("作业 %@，%@，点击查看步骤", job.name, job.state.label))
+            } else {
+                indicator(color: job.state.color)
+                    .accessibilityLabel("\(job.name)，\(job.state.label)")
             }
         }
-
-        if let onStageTap, let firstJob = stage.jobs.first {
-            Button { onStageTap(firstJob) } label: { content }
-                .buttonStyle(.plain)
-                .accessibilityLabel(LF("阶段 %@，%@，%ld 个作业，点击查看步骤", stage.name, stage.state.label, stage.jobs.count))
-        } else {
-            content
-        }
+        .help("\(job.name)\n\(job.state.label)")
     }
 
     @ViewBuilder
@@ -3835,6 +3835,7 @@ private struct PipelineStageGroupList: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel(LF("阶段 %@，%ld 个作业", group.name, group.jobs.count))
+            .help(group.state.label)
 
             if expandedGroupID == group.id {
                 VStack(spacing: 0) {
@@ -3865,6 +3866,7 @@ private struct PipelineStageGroupList: View {
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel(LF("作业 %@，%@，点击查看日志", job.name, job.state.label))
+                        .help(job.state.label)
                     }
                 }
                 .padding(.leading, 17)

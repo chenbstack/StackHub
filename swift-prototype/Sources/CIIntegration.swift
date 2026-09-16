@@ -142,13 +142,7 @@ struct RemotePipeline: Identifiable, Decodable {
     let updatedAt: Date?
     let startedAt: Date?
 
-    var state: PipelineState {
-        switch status.lowercased() {
-        case "success", "passed", "completed": return .success
-        case "running", "in_progress", "in progress", "pending", "queued": return .running
-        default: return .failed
-        }
-    }
+    var state: PipelineState { PipelineState(remoteStatus: status) }
 }
 
 struct RemoteJob: Identifiable, Decodable {
@@ -159,13 +153,8 @@ struct RemoteJob: Identifiable, Decodable {
     let duration: String
     let log: String
 
-    var state: PipelineState {
-        switch status.lowercased() {
-        case "success", "passed", "completed": return .success
-        case "running", "in_progress", "pending", "queued": return .running
-        default: return .failed
-        }
-    }
+    var stageOrder: Int? = nil
+    var state: PipelineState { PipelineState(remoteStatus: status) }
 }
 
 // MARK: - GitHub REST
@@ -482,12 +471,65 @@ final class GitLabAPIClient {
         return response.map { makeRemotePipeline($0, prefix: prefix) }
     }
 
-    func jobs(projectID: String, pipelineID: String) async throws -> [RemoteJob] {
+    func jobs(projectID: String, pipelineID: String, repository: String = "") async throws -> [RemoteJob] {
         let encoded = apiProjectID(projectID)
         let url = try makeURL(path: "/api/v4/projects/\(encoded)/pipelines/\(pipelineID)/jobs", query: [URLQueryItem(name: "per_page", value: "100")])
         let response: [GitLabJob] = try await send(url)
-        return response.map {
-            RemoteJob(id: "gitlab-job-\($0.id)", name: $0.name, stage: $0.stage, status: $0.status, duration: CIExecutionTimeFormatter.duration(seconds: $0.duration), log: "")
+        // REST jobs are newest first, not in pipeline stage order. Obtain the
+        // declared stages once per pipeline; job retries can have newer IDs.
+        let order = Set(response.map(\.stage)).count > 1 && !repository.isEmpty
+            ? await pipelineStageOrder(repository: repository, pipelineID: pipelineID) : []
+        try Task.checkCancellation()
+        let firstIDs = Dictionary(grouping: response, by: \.stage).mapValues { $0.map(\.id).min() ?? Int.max }
+        return response.sorted { left, right in
+            if left.stage != right.stage {
+                let leftOrder = order.firstIndex(of: left.stage) ?? Int.max
+                let rightOrder = order.firstIndex(of: right.stage) ?? Int.max
+                if leftOrder != rightOrder { return leftOrder < rightOrder }
+                return (firstIDs[left.stage] ?? 0) < (firstIDs[right.stage] ?? 0)
+            }
+            let nameOrder = left.name.localizedStandardCompare(right.name)
+            return nameOrder == .orderedSame ? left.id < right.id : nameOrder == .orderedAscending
+        }.map {
+            RemoteJob(id: "gitlab-job-\($0.id)", name: $0.name, stage: $0.stage, status: $0.status,
+                      duration: CIExecutionTimeFormatter.duration(seconds: $0.duration), log: "", stageOrder: order.firstIndex(of: $0.stage))
+        }
+    }
+
+    private static let stageOrders: NSCache<NSString, GitLabStageOrder> = {
+        let cache = NSCache<NSString, GitLabStageOrder>()
+        cache.countLimit = 256
+        return cache
+    }()
+
+    private func pipelineStageOrder(repository: String, pipelineID: String) async -> [String] {
+        let key = "\(baseURL.absoluteString)|\(repository)|\(pipelineID)" as NSString
+        if let cached = Self.stageOrders.object(forKey: key), cached.expiresAt > Date() { return cached.names }
+        do {
+            let variables = try JSONSerialization.data(withJSONObject: [
+                "project": repository, "pipeline": "gid://gitlab/Ci::Pipeline/\(pipelineID)"
+            ])
+            let query = """
+            query PipelineStages($project: ID!, $pipeline: CiPipelineID!) {
+              project(fullPath: $project) { pipeline(id: $pipeline) { stages(first: 100) { nodes { name } } } }
+            }
+            """
+            let url = try makeURL(path: "/api/graphql", query: [
+                URLQueryItem(name: "query", value: query),
+                URLQueryItem(name: "variables", value: String(decoding: variables, as: UTF8.self))
+            ])
+            let response: GitLabStageOrderResponse = try await send(url)
+            let names = response.data?.project?.pipeline?.stages.nodes.compactMap(\.name) ?? []
+            if !Task.isCancelled {
+                Self.stageOrders.setObject(GitLabStageOrder(names: names), forKey: key)
+            }
+            return names
+        } catch {
+            // Ordering metadata is optional on older/self-hosted instances.
+            // Preserve job results and back off rather than failing refresh or
+            // issuing this extra request every round when GraphQL is disabled.
+            if !Task.isCancelled { Self.stageOrders.setObject(GitLabStageOrder(names: []), forKey: key) }
+            return []
         }
     }
 
@@ -606,4 +648,30 @@ private struct GitLabJob: Decodable {
     let stage: String
     let status: String
     let duration: Double?
+}
+
+private final class GitLabStageOrder {
+    let names: [String]
+    let expiresAt: Date
+    init(names: [String]) {
+        self.names = names
+        expiresAt = Date().addingTimeInterval(names.isEmpty ? 300 : 86_400)
+    }
+}
+
+private struct GitLabStageOrderResponse: Decodable {
+    struct Result: Decodable {
+        struct Project: Decodable {
+            struct Pipeline: Decodable {
+                struct Stages: Decodable {
+                    struct Stage: Decodable { let name: String? }
+                    let nodes: [Stage]
+                }
+                let stages: Stages
+            }
+            let pipeline: Pipeline?
+        }
+        let project: Project?
+    }
+    let data: Result?
 }

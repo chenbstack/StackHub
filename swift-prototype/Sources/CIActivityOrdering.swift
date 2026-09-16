@@ -80,7 +80,7 @@ enum CIActivityOrdering {
     ) -> [CIAccessibleProject] {
         let projects = uniqueProjects(retained)
         let runningIDs = Set(projects.compactMap { project in
-            pipelineCache[project.id]?.contains { $0.state == .running } == true ? project.id : nil
+            pipelineCache[project.id]?.contains { $0.state.needsStatusRefresh } == true ? project.id : nil
         })
         return projects.filter { runningIDs.contains($0.id) } + projects.filter { !runningIDs.contains($0.id) }
     }
@@ -101,7 +101,7 @@ enum CIActivityOrdering {
         let recentIDs = Set(projects.prefix(limit).map(\.id))
         let trackedIDs = Set(projects.filter { project in
             followedIDs.contains(project.id) ||
-                pipelineCache[project.id]?.contains { $0.state == .running } == true
+                pipelineCache[project.id]?.contains { $0.state.needsStatusRefresh } == true
         }.map(\.id))
         let changedIDs = Set(projects.filter { project in
             project.updatedAt.map { $0 > (successfulPolls[project.id] ?? .distantPast) } == true
