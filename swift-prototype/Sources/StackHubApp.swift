@@ -636,6 +636,9 @@ final class StackHubStore: ObservableObject {
     @Published var selectedCIProjectID: String?
     @Published var expandedStageID: String? = "test"
     @Published var selectedPipeline: Pipeline?
+    @Published var selectedCILogStageID: String?
+    private(set) var ciLogOpenedFromOverview = false
+    @Published var ciLogError: String?
     @Published var selectedServiceLogID: String?
     /// Credential state is non-sensitive metadata for the UI. Reading Keychain
     /// is deferred until an action actually needs a token.
@@ -1810,8 +1813,24 @@ final class StackHubStore: ObservableObject {
     func openPipeline(_ pipeline: Pipeline) {
         selectedPipeline = pipeline
         expandedStageID = nil
-        Task { [weak self] in
-            guard let self else { return }
+        Task { await refreshPipelineDetails(pipeline) }
+    }
+
+    func openStageLog(for pipeline: Pipeline, stage: PipelineStage) {
+        guard pipeline.hasLoadedStages else { openPipeline(pipeline); return }
+        ciLogOpenedFromOverview = selectedPipeline == nil
+        selectedPipeline = pipeline
+        selectedCILogStageID = stage.id
+        ciLogError = nil
+    }
+
+    func closeStageLog() {
+        selectedCILogStageID = nil
+        if ciLogOpenedFromOverview { selectedPipeline = nil }
+        ciLogOpenedFromOverview = false
+    }
+
+    func refreshPipelineDetails(_ pipeline: Pipeline) async {
             do {
                 let jobs: [RemoteJob]
                 if pipeline.provider == "GitHub Actions" {
@@ -1828,6 +1847,7 @@ final class StackHubStore: ObservableObject {
                     jobs = try await GitLabAPIClient(instanceURL: instance.host, token: token, session: ciSession).jobs(projectID: project.id, pipelineID: pipelineID, repository: pipeline.repository)
                 }
 
+                try Task.checkCancellation()
                 // Jobs may return after the summary refresh has completed.
                 // Attach them to the live pipeline, retaining its current
                 // overall status and duration rather than the opening snapshot.
@@ -1840,9 +1860,8 @@ final class StackHubStore: ObservableObject {
                 self.pipelineCache[pipeline.projectID] = self.pipelineCache[pipeline.projectID]?.map { $0.id == pipeline.id ? detailed : $0 }
                 if selected != nil { self.selectedPipeline = detailed }
             } catch {
-                self.ciError = error.localizedDescription
+                if !Task.isCancelled { self.ciError = error.localizedDescription }
             }
-        }
     }
 
     func isLoadingStage(_ stageID: String) -> Bool {
@@ -1850,11 +1869,9 @@ final class StackHubStore: ObservableObject {
     }
 
     /// Fetch one job trace after the user explicitly selects its stage.
-    func loadStageLog(for pipeline: Pipeline, stage: PipelineStage) {
-        guard pipeline.hasLoadedStages, stage.log.isEmpty, !loadingStageIDs.contains(stage.id) else { return }
+    func loadStageLog(for pipeline: Pipeline, stage: PipelineStage) async {
+        guard pipeline.hasLoadedStages, !loadingStageIDs.contains(stage.id) else { return }
         loadingStageIDs.insert(stage.id)
-        Task { [weak self] in
-            guard let self else { return }
             defer { self.loadingStageIDs.remove(stage.id) }
             do {
                 let log: String
@@ -1872,6 +1889,8 @@ final class StackHubStore: ObservableObject {
                     log = try await GitLabAPIClient(instanceURL: instance.host, token: token).jobLog(projectID: project.id, jobID: jobID)
                 }
 
+                try Task.checkCancellation()
+                self.ciLogError = nil
                 let update: (Pipeline) -> Pipeline = { current in
                     let stages = current.stages.map { currentStage in
                         guard currentStage.id == stage.id else { return currentStage }
@@ -1910,9 +1929,15 @@ final class StackHubStore: ObservableObject {
                     self.selectedPipeline = update(current)
                 }
             } catch {
-                self.ciError = error.localizedDescription
+                if !Task.isCancelled {
+                    if pipeline.provider == "GitHub Actions", stage.state.needsStatusRefresh,
+                       case CIIntegrationError.http(404, _) = error {
+                        self.ciLogError = L("GitHub 暂未提供该作业日志，将自动重试。")
+                    } else {
+                        self.ciLogError = error.localizedDescription
+                    }
+                }
             }
-        }
     }
 
     func isFollowing(_ projectID: String) -> Bool {
@@ -2168,8 +2193,7 @@ final class StackHubStore: ObservableObject {
             persistCIState()
             return
         }
-        let process = ServiceShell.makeProcess(command: service.command, directory: directory, runtime: runtime)
-        process.environment = runtimeResolver.environment
+        let process = ServiceShell.makeProcess(command: service.command, directory: directory, runtime: runtime, environment: runtimeResolver.environment)
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
@@ -2401,20 +2425,34 @@ struct StackHubPanel: View {
     var body: some View {
         ZStack(alignment: .bottom) {
             VStack(spacing: 0) {
-                if let service = store.selectedServiceLog {
-                    ServiceLogDetailView(service: service) {
-                        withAnimation(.easeOut(duration: 0.18)) { store.selectedServiceLogID = nil }
+                ZStack {
+                    if let destination = selectedDestination {
+                        destinationContent(destination)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        // Keep the original view and its NSScrollView alive while logs
+                        // cover it, retaining exact offset and expanded project state.
+                        mainPanelContent
+                            .opacity(store.selectedServiceLog != nil || store.selectedCILogStageID != nil ? 0 : 1)
+                            .allowsHitTesting(store.selectedServiceLog == nil && store.selectedCILogStageID == nil)
+                            .accessibilityHidden(store.selectedServiceLog != nil || store.selectedCILogStageID != nil)
                     }
-                    .id(service.id)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if let destination = selectedDestination {
-                    destinationContent(destination)
+                    if let service = store.selectedServiceLog {
+                        ServiceLogDetailView(service: service) {
+                            withAnimation(.easeOut(duration: 0.18)) { store.selectedServiceLogID = nil }
+                        }
+                        .id(service.id)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    mainPanelContent
+                    } else if let pipeline = store.selectedPipeline, let stageID = store.selectedCILogStageID {
+                        CIJobLogDetailView(pipeline: pipeline, stageID: stageID) {
+                            store.closeStageLog()
+                        }
+                        .id("\(pipeline.id):\(stageID)")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
                 }
                 PanelResizeHandle(height: $panelHeight)
-                    .frame(height: 16)
+                    .frame(height: 10)
                     .frame(maxWidth: .infinity)
             }
             .frame(width: 410, height: panelHeight)
@@ -2435,6 +2473,9 @@ struct StackHubPanel: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
+        .overlayPreferenceValue(CIJobHoverPreference.self) { target in
+            CIJobHoverOverlay(target: store.selectedCILogStageID == nil && store.selectedServiceLog == nil && !isShowingPipelineDetail ? target : nil)
+        }
         .environment(\.colorScheme, .dark)
         .environment(\.locale, selectedLanguage.locale)
         .preferredColorScheme(.dark)
@@ -2448,22 +2489,17 @@ struct StackHubPanel: View {
         }
     }
 
+    private var isShowingPipelineDetail: Bool {
+        store.selectedPipeline != nil && store.tab == .ci && !store.ciLogOpenedFromOverview
+    }
+
     private var mainPanelContent: some View {
         VStack(spacing: 0) {
             contentHeader
             TabStrip(selection: $store.tab)
                 .padding(.horizontal, 16)
                 .padding(.bottom, 13)
-            if let pipeline = store.selectedPipeline, store.tab == .ci {
-                // Keep the detail screen outside the page ScrollView so
-                // the log viewer receives a bounded height and its own
-                // vertical scroll gesture.
-                PipelineDetailView(pipeline: pipeline) { store.selectedPipeline = nil }
-                    .id(pipeline.id)
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 16)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-            } else {
+            ZStack {
                 OverlayScrollView {
                     Group {
                         switch store.tab {
@@ -2479,6 +2515,16 @@ struct StackHubPanel: View {
                     .padding(.bottom, 16)
                 }
                 .frame(maxHeight: .infinity)
+                    .opacity(isShowingPipelineDetail ? 0 : 1)
+                    .allowsHitTesting(!isShowingPipelineDetail)
+                    .accessibilityHidden(isShowingPipelineDetail)
+                if isShowingPipelineDetail, let pipeline = store.selectedPipeline {
+                    PipelineDetailView(pipeline: pipeline) { store.selectedPipeline = nil }
+                        .id(pipeline.id)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 16)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                }
             }
             HStack {
                 QuitStackHubButton()
@@ -2491,7 +2537,7 @@ struct StackHubPanel: View {
                 }
             }
             .padding(.horizontal, 16)
-            .padding(.vertical, 11)
+            .padding(.vertical, 7)
             .overlay(alignment: .top) { Rectangle().fill(.white.opacity(0.08)).frame(height: 1) }
         }
     }
@@ -2973,15 +3019,6 @@ struct ServiceLogDetailView: View {
         log.isEmpty ? 0 : log.split(separator: "\n", omittingEmptySubsequences: false).count
     }
 
-    private var displayedLog: AttributedString {
-        guard !log.isEmpty else {
-            var placeholder = AttributedString("服务尚未输出日志。启动后 stdout/stderr 会实时显示。")
-            placeholder.foregroundColor = .secondary
-            return placeholder
-        }
-        return ANSILogRenderer.attributedString(from: log)
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
@@ -3039,13 +3076,10 @@ struct ServiceLogDetailView: View {
             .padding(.vertical, 14)
             .overlay(alignment: .bottom) { Rectangle().fill(.white.opacity(0.08)).frame(height: 1) }
 
-            OverlayScrollView {
-                Text(displayedLog)
-                    .font(.system(size: 11, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(16)
-            }
+            FollowingLogView(
+                text: log.isEmpty ? L("服务尚未输出日志。启动后 stdout/stderr 会实时显示。") : log,
+                isPlaceholder: log.isEmpty
+            )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color.black.opacity(0.26))
         }
@@ -3100,7 +3134,7 @@ struct CIView: View {
                                 }
                             },
                             onOpen: { pipeline in store.openPipeline(pipeline) },
-                            onStageTap: { pipeline, _ in store.openPipeline(pipeline) }
+                            onStageTap: { pipeline, stage in store.openStageLog(for: pipeline, stage: stage) }
                         )
                     }
                 }
@@ -3131,7 +3165,7 @@ struct CIView: View {
                             }
                         },
                         onOpen: { store.openPipeline(activity.pipeline) },
-                        onStageTap: { _ in store.openPipeline(activity.pipeline) }
+                        onStageTap: { stage in store.openStageLog(for: activity.pipeline, stage: stage) }
                     )
                 }
             }
@@ -3144,7 +3178,15 @@ struct CIView: View {
             store.refreshCIIfNeeded()
         }
         .onDisappear { store.setCIActivityVisible(false) }
-        .onReceive(refreshTimer) { _ in store.refreshCIIfNeeded() }
+        .onChange(of: store.selectedCILogStageID) { _, stageID in
+            store.setCIActivityVisible(stageID == nil && store.selectedPipeline == nil)
+        }
+        .onChange(of: store.selectedPipeline?.id) { _, pipelineID in
+            store.setCIActivityVisible(pipelineID == nil && store.selectedCILogStageID == nil)
+        }
+        .onReceive(refreshTimer) { _ in
+            if store.selectedPipeline == nil { store.refreshCIIfNeeded() }
+        }
     }
 }
 
@@ -3265,7 +3307,6 @@ struct CIActivityRow: View {
             HStack(spacing: 7) {
                 Text(L(pipeline.id.hasPrefix("github") ? "构建与测试" : "发布流水线"))
                     .font(.caption.weight(.semibold))
-                CIStageProgress(stages: pipeline.stages, isLoaded: pipeline.hasLoadedStages, onStageTap: onStageTap)
                 Spacer(minLength: 2)
                 if pipeline.duration != "—" {
                     Text(pipeline.duration)
@@ -3286,6 +3327,7 @@ struct CIActivityRow: View {
                     .help(L(pipeline.provider == "GitHub Actions" ? "查看运行" : "查看流水线"))
                     .accessibilityLabel(L(pipeline.provider == "GitHub Actions" ? "查看运行" : "查看流水线"))
             }
+            CIStageProgress(stages: pipeline.stages, isLoaded: pipeline.hasLoadedStages, onStageTap: onStageTap)
         }
         .padding(10)
         .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
@@ -3365,11 +3407,6 @@ struct CIProjectCard: View {
                     Text("最新流水线")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-                    CIStageProgress(
-                        stages: latest.stages,
-                        isLoaded: latest.hasLoadedStages,
-                        onStageTap: { stage in onStageTap(latest, stage) }
-                    )
                     Spacer()
                     Text(latest.executionTimestampLabel)
                         .font(.caption2)
@@ -3377,6 +3414,11 @@ struct CIProjectCard: View {
                         .lineLimit(1)
                 }
                 .padding(.top, 7)
+                CIStageProgress(
+                    stages: latest.stages,
+                    isLoaded: latest.hasLoadedStages,
+                    onStageTap: { stage in onStageTap(latest, stage) }
+                )
             } else {
                 Text("刷新后显示最近流水线")
                     .font(.caption2)
@@ -3414,6 +3456,7 @@ struct CIProjectCard: View {
 
 struct CIStageProgress: View {
     let stages: [PipelineStage]
+    @State private var hoveredJobID: String?
     let isLoaded: Bool
     let onStageTap: ((PipelineStage) -> Void)?
 
@@ -3438,25 +3481,41 @@ struct CIStageProgress: View {
             }
         } else {
             ViewThatFits(in: .horizontal) {
-                jobIndicators.fixedSize(horizontal: true, vertical: false)
-                ScrollView(.horizontal) {
-                    jobIndicators
+                stageGroups.fixedSize(horizontal: true, vertical: false)
+                OverlayScrollView(axes: .horizontal) { stageGroups }
+            }
+            .frame(height: 24)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+        }
+    }
+
+    private var stageGroups: some View {
+        HStack(spacing: 6) {
+            ForEach(Array(stages.groupedPipelineStages.enumerated()), id: \.element.id) { index, stage in
+                if index > 0 {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .medium))
+                        .foregroundStyle(.tertiary)
                 }
-                .scrollIndicators(.hidden)
-                .frame(height: 15)
+                HStack(spacing: 3) {
+                    Text(stage.name)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1).help(stage.name)
+                    stageIndicators(stage)
+                }
             }
         }
     }
 
-    private var jobIndicators: some View {
-        HStack(spacing: 7) {
-            ForEach(stages.groupedPipelineStages) { stage in
-                HStack(spacing: 3) {
-                    ForEach(stage.jobs) { job in
-                        jobIndicator(job)
-                    }
-                }
-            }
+    private var hoveredJob: PipelineStage? {
+        stages.first { $0.id == hoveredJobID }
+    }
+
+    private func stageIndicators(_ stage: PipelineStageGroup) -> some View {
+        HStack(spacing: 0) {
+            ForEach(stage.jobs) { job in jobIndicator(job) }
         }
     }
 
@@ -3473,7 +3532,15 @@ struct CIStageProgress: View {
                     .accessibilityLabel("\(job.name)，\(job.state.label)")
             }
         }
-        .help("\(job.name)\n\(job.state.label)")
+        .frame(width: 18, height: 22)
+        .contentShape(Rectangle())
+        .anchorPreference(key: CIJobHoverPreference.self, value: .bounds) { anchor in
+            hoveredJobID == job.id ? CIJobHoverTarget(job: job, bounds: anchor) : nil
+        }
+        .onHover { hovering in
+            if hovering { hoveredJobID = job.id }
+            else if hoveredJobID == job.id { hoveredJobID = nil }
+        }
     }
 
     @ViewBuilder
@@ -3531,9 +3598,6 @@ struct CIRunRow: View {
                     .controlSize(.small)
             }
             HStack(spacing: 8) {
-                Text("阶段")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
                 CIStageProgress(stages: pipeline.stages, isLoaded: pipeline.hasLoadedStages, onStageTap: onStageTap)
             }
         }
@@ -3658,123 +3722,96 @@ struct StageRow: View {
 
 // MARK: - Pipeline detail
 
+struct CIJobLogDetailView: View {
+    @EnvironmentObject private var store: StackHubStore
+    let pipeline: Pipeline
+    let stageID: String
+    let onClose: () -> Void
+    @State private var hasAttemptedLoad = false
+
+    private var stage: PipelineStage? { pipeline.stages.first { $0.id == stageID } }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Button(action: onClose) { Label("返回", systemImage: "chevron.left") }
+                    .buttonStyle(StackSecondaryButtonStyle()).controlSize(.small)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("作业日志").font(.subheadline.weight(.semibold))
+                    Text(stage?.name ?? "—").font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                if let stage {
+                    Text(stage.state.label).font(.caption2).foregroundStyle(stage.state.color)
+                }
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(stage?.log ?? "", forType: .string)
+                } label: {
+                    Image(systemName: "doc.on.doc").frame(width: 28, height: 28)
+                }
+                .buttonStyle(StackIconButtonStyle())
+                .help(L("复制日志")).accessibilityLabel(L("复制日志"))
+                .disabled(stage?.log.isEmpty != false)
+            }
+            .padding(.horizontal, 16).padding(.vertical, 14)
+            .overlay(alignment: .bottom) { Divider() }
+            if let error = store.ciLogError {
+                Text(error).font(.caption2).foregroundStyle(.orange)
+                    .lineLimit(2).padding(8).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            FollowingLogView(
+                text: stage?.log.isEmpty == false ? stage!.log : (hasAttemptedLoad ? L("暂无作业日志") : L("正在加载作业日志…")),
+                isPlaceholder: stage?.log.isEmpty != false
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.black.opacity(0.26))
+        }
+        .background(Color(red: 0.055, green: 0.075, blue: 0.12))
+        .closesOnEscape(perform: onClose)
+        .task(id: stageID) {
+            await CILogPolling.run {
+                guard let current = store.selectedPipeline,
+                      current.id == pipeline.id, store.selectedCILogStageID == stageID else { return false }
+                await store.refreshPipelineDetails(current)
+                guard !Task.isCancelled, let refreshed = store.selectedPipeline,
+                      refreshed.id == pipeline.id,
+                      let job = refreshed.stages.first(where: { $0.id == stageID }) else { return false }
+                await store.loadStageLog(for: refreshed, stage: job)
+                hasAttemptedLoad = true
+                return job.state.needsStatusRefresh || store.ciLogError != nil
+            }
+        }
+    }
+}
+
 struct PipelineDetailView: View {
     @EnvironmentObject private var store: StackHubStore
     let pipeline: Pipeline
     let onClose: () -> Void
     @State private var selectedStageID: String?
-    @State private var expandedStageGroupID: String?
-
-    init(pipeline: Pipeline, onClose: @escaping () -> Void) {
-        self.pipeline = pipeline
-        self.onClose = onClose
-        // Opening a pipeline is intentionally a steps-only view. A stage is
-        // selected only when the user clicks a stage chip in this detail view.
-        _selectedStageID = State(initialValue: nil)
-        _expandedStageGroupID = State(initialValue: nil)
-    }
-
-    private var selectedStage: PipelineStage? {
-        guard let selectedStageID else { return nil }
-        return pipeline.stages.first(where: { $0.id == selectedStageID })
-    }
-
-    private var displayedLog: String {
-        guard pipeline.hasLoadedStages else { return L("正在加载作业日志…") }
-        guard let selectedStage else { return L("暂无作业日志") }
-        guard !selectedStage.log.isEmpty else {
-            return store.isLoadingStage(selectedStage.id) ? L("正在加载该步骤日志…") : L("该阶段暂无日志")
-        }
-        return "[\(selectedStage.name)]\n\(selectedStage.log)"
-    }
-
-    private var logLineCount: Int {
-        guard pipeline.hasLoadedStages, selectedStage?.log.isEmpty == false else { return 0 }
-        return displayedLog.split(separator: "\n", omittingEmptySubsequences: false).count
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 15) {
-            HStack { VStack(alignment: .leading, spacing: 4) { Text(L(pipeline.provider == "GitHub Actions" ? "构建与测试" : "发布流水线")).font(.headline); Text("\(pipeline.repository) / \(pipeline.branch)").font(.caption).foregroundStyle(.secondary) }; Spacer(); Button("返回", action: onClose).buttonStyle(StackSecondaryButtonStyle()) }
-            PipelineStageGroupList(
-                pipeline: pipeline,
-                selectedStageID: $selectedStageID,
-                expandedGroupID: $expandedStageGroupID
-            )
-            if let selectedStage {
-                HStack {
-                    Text("作业日志").font(.subheadline.weight(.semibold))
-                    Text("· \(selectedStage.name)").font(.caption2).foregroundStyle(.secondary)
-                    Spacer()
-                    Text(logLineCount == 0 ? L(pipeline.hasLoadedStages ? "暂无日志" : "正在加载") : LF("%ld 行", logLineCount))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(L(pipeline.provider == "GitHub Actions" ? "构建与测试" : "发布流水线")).font(.headline)
+                    Text("\(pipeline.repository) / \(pipeline.branch)").font(.caption).foregroundStyle(.secondary)
                 }
-                OverlayScrollView {
-                    Text(displayedLog)
-                        .font(.system(size: 11, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(14)
+                Spacer()
+                Button("返回", action: onClose).buttonStyle(StackSecondaryButtonStyle())
+            }
+            PipelineStageGroupList(pipeline: pipeline, selectedStageID: $selectedStageID)
+            HStack {
+                Text("请选择一个步骤查看日志").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button(LF("在 %@ 中打开", pipeline.provider == "GitHub Actions" ? "GitHub" : "GitLab")) {
+                    if let value = pipeline.webURL, let url = URL(string: value) { NSWorkspace.shared.open(url) }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .clipped()
-                .background(Color.black.opacity(0.24), in: RoundedRectangle(cornerRadius: 12))
-                HStack {
-                    Button("复制日志") { copyLog() }
-                        .buttonStyle(StackSecondaryButtonStyle())
-                        .disabled(logLineCount == 0)
-                    Spacer()
-                    Button(LF("在 %@ 中打开", pipeline.provider == "GitHub Actions" ? "GitHub" : "GitLab")) { openExternal() }
-                        .buttonStyle(StackPrimaryButtonStyle())
-                        .disabled(pipeline.webURL == nil)
-                }
-            } else {
-                VStack(spacing: 10) {
-                    Image(systemName: "doc.text.magnifyingglass")
-                        .font(.system(size: 24, weight: .medium))
-                        .foregroundStyle(.secondary)
-                    Text("请选择一个步骤查看日志")
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.secondary)
-                    Text("先查看步骤状态，再按需加载对应作业日志")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary.opacity(0.75))
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 12))
-                HStack {
-                    Spacer()
-                    Button(LF("在 %@ 中打开", pipeline.provider == "GitHub Actions" ? "GitHub" : "GitLab")) { openExternal() }
-                        .buttonStyle(StackPrimaryButtonStyle())
-                        .disabled(pipeline.webURL == nil)
-                }
+                .buttonStyle(StackPrimaryButtonStyle()).disabled(pipeline.webURL == nil)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .preferredColorScheme(.dark)
-        .onChange(of: pipeline.stages.map(\.id)) { _, stageIDs in
-            guard !stageIDs.isEmpty else {
-                selectedStageID = nil
-                return
-            }
-            guard let selectedStageID, stageIDs.contains(selectedStageID) else {
-                // A normal "查看流水线" action remains steps-only even after
-                // the async job list replaces the summary placeholder.
-                selectedStageID = nil
-                return
-            }
-        }
-    }
-
-    private func copyLog() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(displayedLog, forType: .string)
-    }
-
-    private func openExternal() {
-        guard let value = pipeline.webURL, let url = URL(string: value) else { return }
-        NSWorkspace.shared.open(url)
     }
 }
 
@@ -3782,7 +3819,6 @@ private struct PipelineStageGroupList: View {
     @EnvironmentObject private var store: StackHubStore
     let pipeline: Pipeline
     @Binding var selectedStageID: String?
-    @Binding var expandedGroupID: String?
 
     private var groups: [PipelineStageGroup] { pipeline.stages.groupedPipelineStages }
 
@@ -3791,96 +3827,105 @@ private struct PipelineStageGroupList: View {
             if !pipeline.hasLoadedStages {
                 HStack(spacing: 8) {
                     CIStageProgress(stages: pipeline.stages, isLoaded: false)
-                    Text(L("正在加载步骤…"))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                    Text(L("正在加载步骤…")).font(.caption2).foregroundStyle(.secondary)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 OverlayScrollView {
-                    VStack(alignment: .leading, spacing: 8) {
-                        ForEach(groups) { group in
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(groups.enumerated()), id: \.element.id) { index, group in
+                            if index > 0 {
+                                Rectangle().fill(Color.white.opacity(0.16))
+                                    .frame(width: 1, height: 14)
+                                    .padding(.leading, 21)
+                                    .accessibilityHidden(true)
+                            }
                             stageGroup(group)
                         }
                     }
-                    .padding(.trailing, 4)
+                    .padding(1)
+                    .padding(.trailing, 3)
                 }
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: selectedStageID == nil ? 210 : 150, alignment: .topLeading)
-        .onAppear { selectFirstAvailableGroupIfNeeded() }
-        .onChange(of: groups.map(\.id)) { _, _ in selectFirstAvailableGroupIfNeeded() }
+        .frame(maxWidth: .infinity, maxHeight: selectedStageID == nil ? .infinity : 220, alignment: .topLeading)
     }
 
     private func stageGroup(_ group: PipelineStageGroup) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Button {
-                withAnimation(.easeOut(duration: 0.16)) {
-                    expandedGroupID = expandedGroupID == group.id ? nil : group.id
-                }
-            } label: {
+        VStack(alignment: .leading, spacing: 0) {
+            // GitHub exposes jobs without named stages. Avoid repeating the
+            // same job name in both an artificial heading and the job row.
+            if pipeline.provider != "GitHub Actions", group.jobs.contains(where: { $0.group != nil }) {
                 HStack(spacing: 8) {
-                    Circle().fill(group.state.color).frame(width: 9, height: 9)
-                    Text(LF("阶段：%@", group.name)).font(.subheadline.weight(.medium))
-                    Spacer()
+                    Text(group.name).font(.caption.weight(.semibold))
+                    Spacer(minLength: 8)
                     Text(LF("%ld 个作业", group.jobs.count))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    Image(systemName: "chevron.down")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .rotationEffect(.degrees(expandedGroupID == group.id ? 180 : 0))
+                        .font(.caption2).foregroundStyle(.secondary)
                 }
-                .contentShape(Rectangle())
+                .padding(.horizontal, 11).padding(.vertical, 9)
+                .accessibilityLabel(LF("阶段 %@，%ld 个作业", group.name, group.jobs.count))
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel(LF("阶段 %@，%ld 个作业", group.name, group.jobs.count))
-            .help(group.state.label)
-
-            if expandedGroupID == group.id {
-                VStack(spacing: 0) {
-                    ForEach(group.jobs) { job in
-                        Button {
-                            selectedStageID = job.id
-                            store.loadStageLog(for: pipeline, stage: job)
-                        } label: {
-                            HStack(spacing: 8) {
-                                Circle().fill(job.state.color).frame(width: 7, height: 7)
-                                Text(job.name)
-                                    .font(.caption)
-                                    .lineLimit(1)
-                                Spacer()
-                                Text(job.duration)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                if selectedStageID == job.id {
-                                    Image(systemName: "checkmark")
-                                        .font(.caption2.weight(.bold))
-                                        .foregroundStyle(job.state.color)
-                                }
+            VStack(spacing: 3) {
+                ForEach(group.jobs) { job in
+                    Button {
+                        store.openStageLog(for: pipeline, stage: job)
+                    } label: {
+                        HStack(spacing: 9) {
+                            Image(systemName: statusSymbol(job.state))
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(job.state.color)
+                                .frame(width: 21, height: 21)
+                                .background(job.state.color.opacity(0.12), in: Circle())
+                            Text(job.name)
+                                .font(.caption.weight(.medium))
+                                .lineLimit(2)
+                                .multilineTextAlignment(.leading)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            if job.duration != "—", !job.duration.isEmpty {
+                                Text(job.duration).font(.caption2).foregroundStyle(.secondary)
                             }
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 7)
-                            .background(selectedStageID == job.id ? job.state.color.opacity(0.14) : .clear, in: RoundedRectangle(cornerRadius: 7))
-                            .contentShape(Rectangle())
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(selectedStageID == job.id ? Color.accentColor : .secondary)
                         }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel(LF("作业 %@，%@，点击查看日志", job.name, job.state.label))
-                        .help(job.state.label)
+                        .padding(.horizontal, 9).padding(.vertical, 8)
+                        .contentShape(Rectangle())
                     }
+                    .buttonStyle(PipelineJobButtonStyle(isSelected: selectedStageID == job.id))
+                    .accessibilityLabel(LF("作业 %@，%@，点击查看日志", job.name, job.state.label))
+                    .help("\(job.name) · \(job.state.label)")
                 }
-                .padding(.leading, 17)
-            }
+            }.padding(4)
         }
-        .padding(10)
-        .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.07)))
+        .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 11))
+        .overlay(RoundedRectangle(cornerRadius: 11).stroke(Color.white.opacity(0.08)))
     }
 
-    private func selectFirstAvailableGroupIfNeeded() {
-        let groupIDs = Set(groups.map(\.id))
-        if let expandedGroupID, groupIDs.contains(expandedGroupID) { return }
-        expandedGroupID = groups.first?.id
+    private func statusSymbol(_ state: PipelineState) -> String {
+        switch state {
+        case .success: return "checkmark.circle.fill"
+        case .failed: return "xmark.circle.fill"
+        case .running: return "arrow.triangle.2.circlepath"
+        case .pending: return "clock"
+        case .manual: return "hand.raised.fill"
+        case .scheduled: return "clock"
+        case .skipped: return "forward.end.fill"
+        case .canceled: return "minus.circle"
+        case .unknown: return "questionmark.circle"
+        }
+    }
+}
+
+private struct PipelineJobButtonStyle: ButtonStyle {
+    let isSelected: Bool
+    @State private var hovered = false
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(.primary)
+            .background(Color.white.opacity(hovered || configuration.isPressed ? 0.08 : 0.025),
+                        in: RoundedRectangle(cornerRadius: 7))
+            .overlay(RoundedRectangle(cornerRadius: 7)
+                .stroke(isSelected ? Color.accentColor.opacity(0.8) : .clear, lineWidth: 1))
+            .onHover { hovered = $0 }
     }
 }
 

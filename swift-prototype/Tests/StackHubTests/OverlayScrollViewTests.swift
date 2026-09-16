@@ -67,6 +67,31 @@ final class OverlayScrollViewTests: XCTestCase {
     }
 
     @MainActor
+    func testHorizontalOverlayKeepsFullHeightAndCanHideIndicators() async throws {
+        for visible in [true, false] {
+            let hosting = NSHostingView(rootView:
+                OverlayScrollView(axes: .horizontal, showsIndicators: visible) {
+                    HStack { ForEach(0..<20) { Text("Stage \($0)").frame(width: 80) } }
+                }
+            )
+            hosting.frame = NSRect(x: 0, y: 0, width: 360, height: 24)
+            hosting.layoutSubtreeIfNeeded()
+            await drainConfigurationQueue()
+            let scroll = try XCTUnwrap(firstScrollView(in: hosting))
+            scroll.scrollerStyle = .legacy
+            await drainConfigurationQueue()
+            scroll.tile()
+            XCTAssertEqual(scroll.scrollerStyle, .overlay)
+            XCTAssertTrue(scroll.autohidesScrollers)
+            XCTAssertEqual(scroll.hasHorizontalScroller, visible)
+            XCTAssertFalse(scroll.hasVerticalScroller)
+            XCTAssertEqual(scroll.contentView.frame.height, scroll.bounds.height, accuracy: 0.5)
+            scroll.contentView.scroll(to: NSPoint(x: 100, y: 0))
+            XCTAssertGreaterThan(scroll.contentView.bounds.minX, 0)
+        }
+    }
+
+    @MainActor
     private func drainConfigurationQueue() async {
         await withCheckedContinuation { continuation in
             DispatchQueue.main.async { continuation.resume() }

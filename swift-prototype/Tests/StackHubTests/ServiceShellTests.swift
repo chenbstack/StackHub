@@ -45,8 +45,33 @@ final class ServiceShellTests: XCTestCase {
         XCTAssertEqual(process.terminationStatus, 7)
     }
 
-    private func run(_ process: Process, startupDirectory: URL) throws -> String {
+    func testLoginStartupRestoresToolPriorityInsteadOfInheritingLauncherPath() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("StackHub-path-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let preferred = root.appendingPathComponent("preferred")
+        let stale = root.appendingPathComponent("stale")
+        for (directory, value) in [(preferred, "preferred"), (stale, "stale")] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let tool = directory.appendingPathComponent("stackhub-path-tool")
+            try "#!/bin/sh\nprintf '%s' \(value)\n".write(to: tool, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: tool.path)
+        }
+        try """
+        case ":$PATH:" in
+          *":$STACKHUB_PREFERRED_BIN:"*) ;;
+          *) export PATH="$STACKHUB_PREFERRED_BIN:$PATH" ;;
+        esac
+        """.write(to: root.appendingPathComponent(".zshrc"), atomically: true, encoding: .utf8)
         var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = "\(stale.path):\(preferred.path):/usr/bin:/bin"
+        environment["STACKHUB_PREFERRED_BIN"] = preferred.path
+        environment["ZDOTDIR"] = root.path
+        let process = ServiceShell.makeProcess(command: "stackhub-path-tool", directory: root, environment: environment)
+        XCTAssertEqual(try RuntimeProbe.run(process, timeout: 3), "preferred")
+    }
+
+    private func run(_ process: Process, startupDirectory: URL) throws -> String {
+        var environment = process.environment ?? ProcessInfo.processInfo.environment
         environment["ZDOTDIR"] = startupDirectory.path
         process.environment = environment
         let output = Pipe()

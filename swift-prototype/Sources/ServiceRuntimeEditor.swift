@@ -23,7 +23,7 @@ struct ServiceRuntimeEditor: View {
     var body: some View {
         DisclosureGroup(isExpanded: $expanded) {
             VStack(alignment: .leading, spacing: 10) {
-                Text("优先使用手动选择，其次读取项目版本文件，最后沿用 Shell 默认。修改后重启服务生效。")
+                Text("修改后重启服务生效。")
                     .font(.caption2).foregroundStyle(.secondary)
                 runtimeRow(.java, choice: $configuration.java)
                 runtimeRow(.node, choice: $configuration.node)
@@ -35,7 +35,7 @@ struct ServiceRuntimeEditor: View {
                     Button { refresh += 1 } label: {
                         Image(systemName: "arrow.clockwise").frame(width: 24, height: 24)
                     }
-                    .buttonStyle(StackIconButtonStyle())
+                    .buttonStyle(PanelHeaderIconButtonStyle())
                     .help(L("重新检测运行环境"))
                     .accessibilityLabel(L("重新检测运行环境"))
                 }
@@ -47,6 +47,7 @@ struct ServiceRuntimeEditor: View {
         } label: {
             Text("运行环境").font(.caption.weight(.semibold))
         }
+        .disclosureGroupStyle(RuntimeDisclosureStyle())
         .task(id: Query(expanded: expanded, directory: directory, refresh: refresh)) {
             guard expanded else { return }
             scanning = true
@@ -83,22 +84,22 @@ struct ServiceRuntimeEditor: View {
 
     private func runtimeRow(_ kind: RuntimeKind, choice: Binding<RuntimeChoice>) -> some View {
         VStack(alignment: .leading, spacing: 5) {
-            Picker(kind.title, selection: choice.mode) {
-                ForEach(RuntimeMode.allCases, id: \.self) { mode in Text(mode.label).tag(mode) }
+            HStack(spacing: 10) {
+                Text(kind.title)
+                    .font(.caption.weight(.semibold))
+                    .frame(width: 48, alignment: .leading)
+                RuntimeSelect(
+                    title: kind.title,
+                    selection: Binding(get: { choice.wrappedValue.mode.rawValue }, set: {
+                        guard let mode = RuntimeMode(rawValue: $0) else { return }
+                        choice.wrappedValue.mode = mode
+                    }),
+                    options: RuntimeMode.allCases.map { .init(id: $0.rawValue, title: $0.label) }
+                )
             }
-            .pickerStyle(.menu).controlSize(.small)
             if choice.wrappedValue.mode == .installed {
-                Picker(L("已安装版本"), selection: choice.path) {
-                    Text(L("请选择版本")).tag("")
-                    let options = installations.filter { $0.kind == kind }
-                    if !choice.wrappedValue.path.isEmpty, !options.contains(where: { $0.path == choice.wrappedValue.path }) {
-                        Text(LF("当前路径：%@", choice.wrappedValue.path)).tag(choice.wrappedValue.path)
-                    }
-                    ForEach(options) { item in
-                        Text("\(item.version) · \(item.path)").tag(item.path)
-                    }
-                }
-                .pickerStyle(.menu).controlSize(.small)
+                RuntimeSelect(title: L("已安装版本"), selection: choice.path,
+                              options: installedOptions(kind, choice: choice.wrappedValue))
             } else if choice.wrappedValue.mode == .custom {
                 HStack(spacing: 6) {
                     TextField(L(kind == .java ? "JDK 主目录或 .jdk 目录" : "Node 可执行文件路径"), text: choice.path)
@@ -107,22 +108,44 @@ struct ServiceRuntimeEditor: View {
                     Button { choosePath(kind, choice: choice) } label: {
                         Image(systemName: "folder").frame(width: 24, height: 24)
                     }
-                        .buttonStyle(StackIconButtonStyle())
+                        .buttonStyle(PanelHeaderIconButtonStyle())
                         .help(L("选择运行时路径"))
                         .accessibilityLabel(LF("选择 %@ 路径", kind.title))
                 }
             }
             if let resolved = resolution?[kind] {
                 if let runtime = resolved.installation {
-                    Text("\(kind.title) \(runtime.version)").font(.caption.weight(.medium))
-                    Text(runtime.path).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
-                    Text(LF("来源：%@", resolved.source)).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
+                    HStack(spacing: 8) {
+                        Text(runtime.version).font(.caption.weight(.medium))
+                        Spacer(minLength: 0)
+                        Text(resolved.source).font(.caption2).foregroundStyle(.secondary)
+                            .help(LF("来源：%@", resolved.source))
+                    }
+                    Text(runtime.path)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2).truncationMode(.middle)
+                        .textSelection(.enabled)
+                        .help(runtime.path)
                 } else {
                     Text(LF("Shell 中未检测到 %@（仅在服务需要时配置）", kind.title))
                         .font(.caption2).foregroundStyle(.secondary)
                 }
             }
         }
+        .padding(10)
+        .background(Color.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.06)))
+    }
+
+    private func installedOptions(_ kind: RuntimeKind, choice: RuntimeChoice) -> [RuntimeSelect.Option] {
+        let found = installations.filter { $0.kind == kind }
+        var options: [RuntimeSelect.Option] = [.init(id: "", title: L("请选择版本"))]
+        if !choice.path.isEmpty, !found.contains(where: { $0.path == choice.path }) {
+            options.append(.init(id: choice.path, title: L("当前路径"), detail: choice.path))
+        }
+        options += found.map { .init(id: $0.path, title: $0.version, detail: $0.path) }
+        return options
     }
 
     private func choosePath(_ kind: RuntimeKind, choice: Binding<RuntimeChoice>) {
@@ -136,5 +159,125 @@ struct ServiceRuntimeEditor: View {
         NSApp.activate(ignoringOtherApps: true)
         if panel.runModal() == .OK, let url = panel.url { choice.wrappedValue.path = url.path }
         editorWindow?.makeKeyAndOrderFront(nil)
+    }
+}
+
+private struct RuntimeDisclosureStyle: DisclosureGroupStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button { configuration.isExpanded.toggle() } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: configuration.isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .frame(width: 14)
+                    configuration.label
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(.primary)
+                .padding(.vertical, 7)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(PanelHeaderIconButtonStyle())
+            .accessibilityValue(L(configuration.isExpanded ? "已展开" : "已收起"))
+            if configuration.isExpanded { configuration.content }
+        }
+    }
+}
+
+/// Custom SwiftUI select surface; options never use the native macOS picker/menu.
+private struct RuntimeSelect: View {
+    struct Option: Identifiable {
+        let id: String
+        let title: String
+        var detail: String? = nil
+    }
+    let title: String
+    @Binding var selection: String
+    let options: [Option]
+    @State private var isPresented = false
+    @State private var isHovered = false
+
+    private var selected: Option? { options.first { $0.id == selection } }
+
+    var body: some View {
+        Button { isPresented.toggle() } label: {
+            HStack(spacing: 8) {
+                Text(selected?.title ?? L("请选择版本"))
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .font(.caption)
+            .foregroundStyle(.primary)
+            .padding(.horizontal, 10).padding(.vertical, 7)
+            .background(Color.white.opacity(isHovered || isPresented ? 0.09 : 0.045),
+                        in: RoundedRectangle(cornerRadius: 7))
+            .overlay(RoundedRectangle(cornerRadius: 7)
+                .stroke(isPresented ? Color.accentColor.opacity(0.7) : Color.white.opacity(0.10)))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+        .accessibilityLabel(title)
+        .accessibilityValue(selected?.title ?? "")
+        .help(selected?.detail ?? selected?.title ?? title)
+        .popover(isPresented: $isPresented, arrowEdge: .bottom) {
+            ViewThatFits(in: .vertical) {
+                optionsList.fixedSize(horizontal: false, vertical: true)
+                ScrollView { optionsList }
+                    .frame(height: 280)
+            }
+            .frame(width: 300)
+            .frame(maxHeight: 280)
+            .fixedSize(horizontal: false, vertical: true)
+            .background(Color(red: 0.075, green: 0.09, blue: 0.135))
+            .environment(\.colorScheme, .dark)
+            .onExitCommand { isPresented = false }
+        }
+    }
+
+    private var optionsList: some View {
+        VStack(spacing: 3) {
+            ForEach(options) { option in
+                Button {
+                    selection = option.id
+                    isPresented = false
+                } label: {
+                    HStack(spacing: 9) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(option.title).font(.caption)
+                            if let detail = option.detail {
+                                Text(detail).font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2).truncationMode(.middle)
+                            }
+                        }
+                        Spacer(minLength: 0)
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(Color.accentColor)
+                            .opacity(selection == option.id ? 1 : 0)
+                    }
+                    .padding(9)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(RuntimeOptionStyle(selected: selection == option.id))
+                .help(option.detail ?? option.title)
+            }
+        }.padding(5)
+    }
+}
+
+private struct RuntimeOptionStyle: ButtonStyle {
+    let selected: Bool
+    @State private var hovered = false
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(.primary)
+            .background(Color.white.opacity(hovered || configuration.isPressed ? 0.10 : selected ? 0.05 : 0),
+                        in: RoundedRectangle(cornerRadius: 6))
+            .onHover { hovered = $0 }
     }
 }

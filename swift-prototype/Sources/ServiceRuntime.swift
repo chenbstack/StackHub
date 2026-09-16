@@ -4,14 +4,14 @@ import Darwin
 enum RuntimeKind: String, CaseIterable, Codable, Sendable {
     case java, node
     var title: String { self == .java ? "JDK" : "Node.js" }
-    var versionFiles: [String] { self == .java ? [".java-version"] : [".nvmrc", ".node-version"] }
 }
 
 enum RuntimeMode: String, CaseIterable, Codable, Sendable {
+    // Preserve the stored "automatic" value; the UI now calls this Default.
     case automatic, installed, custom
     var label: String {
         switch self {
-        case .automatic: return L("自动（项目配置 / Shell 默认）")
+        case .automatic: return L("默认")
         case .installed: return L("已安装版本")
         case .custom: return L("自定义路径")
         }
@@ -46,6 +46,7 @@ struct RuntimeInstallation: Identifiable, Equatable, Sendable {
 struct ResolvedRuntime: Sendable {
     let installation: RuntimeInstallation?
     let source: String
+    var usesShellDefault = false
 }
 
 struct ServiceRuntimeResolution: Sendable {
@@ -55,7 +56,7 @@ struct ServiceRuntimeResolution: Sendable {
     var logDescription: String {
         RuntimeKind.allCases.compactMap { kind -> String? in
             let item = self[kind]
-            guard let runtime = item.installation else { return nil }
+            guard !item.usesShellDefault, let runtime = item.installation else { return nil }
             return "[StackHub] \(kind.title) \(runtime.version) · \(item.source)\n  \(runtime.path)\n"
         }.joined()
     }
@@ -83,11 +84,6 @@ struct ServiceRuntimeResolver: Sendable {
         var requestedNode: String
     }
 
-    struct VersionRequest: Equatable {
-        let value: String
-        let file: URL
-    }
-
     func prepare(configuration: ServiceRuntimeConfiguration, directory: URL) async throws -> ServiceRuntimeResolution {
         let work = Task.detached(priority: .userInitiated) { try resolve(configuration: configuration, directory: directory) }
         return try await withTaskCancellationHandler { try await work.value } onCancel: { work.cancel() }
@@ -100,12 +96,10 @@ struct ServiceRuntimeResolver: Sendable {
 
     func resolve(configuration: ServiceRuntimeConfiguration, directory: URL) throws -> ServiceRuntimeResolution {
         try Task.checkCancellation()
-        let javaRequest = configuration.java.mode == .automatic ? try versionRequest(.java, directory: directory) : nil
-        let nodeRequest = configuration.node.mode == .automatic ? try versionRequest(.node, directory: directory) : nil
-        let shell = try shellEnvironment(directory: directory, nodeRequest: nodeRequest?.value)
+        let shell = try shellEnvironment(directory: directory)
         return ServiceRuntimeResolution(
-            java: try resolve(.java, choice: configuration.java, request: javaRequest, shell: shell, directory: directory),
-            node: try resolve(.node, choice: configuration.node, request: nodeRequest, shell: shell, directory: directory)
+            java: try resolve(.java, choice: configuration.java, shell: shell, directory: directory),
+            node: try resolve(.node, choice: configuration.node, shell: shell, directory: directory)
         )
     }
 
@@ -116,34 +110,7 @@ struct ServiceRuntimeResolver: Sendable {
         }
     }
 
-    func versionRequest(_ kind: RuntimeKind, directory: URL) throws -> VersionRequest? {
-        var current = directory.standardizedFileURL
-        while true {
-            try Task.checkCancellation()
-            for name in kind.versionFiles {
-                let file = current.appendingPathComponent(name)
-                guard FileManager.default.fileExists(atPath: file.path) else { continue }
-                let contents = try String(contentsOf: file, encoding: .utf8)
-                let lines = contents.components(separatedBy: .newlines).map {
-                    $0.components(separatedBy: "#")[0].trimmingCharacters(in: .whitespacesAndNewlines)
-                }.filter { !$0.isEmpty }
-                guard lines.count == 1, let value = lines.first,
-                      value.range(of: #"^[a-zA-Z0-9][a-zA-Z0-9._/*+\-]*$"#, options: .regularExpression) != nil,
-                      !value.contains("..") else {
-                    throw RuntimeConfigurationError(message: LF("版本文件无效：%@", file.path))
-                }
-                return VersionRequest(value: value, file: file)
-            }
-            // URL.deletingLastPathComponent can keep appending /.. at the
-            // filesystem root. Stop explicitly and rebuild a normalized URL.
-            if current.path == "/" { return nil }
-            let parent = (current.path as NSString).deletingLastPathComponent
-            if parent.isEmpty || parent == current.path { return nil }
-            current = URL(fileURLWithPath: parent, isDirectory: true)
-        }
-    }
-
-    private func resolve(_ kind: RuntimeKind, choice: RuntimeChoice, request: VersionRequest?, shell: ShellEnvironment, directory: URL) throws -> ResolvedRuntime {
+    private func resolve(_ kind: RuntimeKind, choice: RuntimeChoice, shell: ShellEnvironment, directory: URL) throws -> ResolvedRuntime {
         try Task.checkCancellation()
         if choice.mode != .automatic {
             guard !choice.path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -151,40 +118,11 @@ struct ServiceRuntimeResolver: Sendable {
             }
             return ResolvedRuntime(installation: try inspect(kind, path: choice.path, directory: directory), source: choice.mode.label)
         }
-        if let request {
-            let managerPath: String
-            if kind == .node {
-                managerPath = shell.requestedNode
-            } else {
-                // jenv aliases point to real JDKs. Reading them also works without
-                // initializing jenv or its export plugin in the user's shell.
-                managerPath = URL(fileURLWithPath: shell.jenvRoot).appendingPathComponent("versions").appendingPathComponent(request.value).path
-            }
-            if !managerPath.isEmpty, let installation = try? inspect(kind, path: managerPath, directory: directory) {
-                return ResolvedRuntime(installation: installation, source: request.file.path)
-            }
-            let candidates = installations(kind, shell: shell, directory: directory)
-            if let installation = candidates.first(where: { Self.matches(version: $0.version, request: request.value, kind: kind) }) {
-                return ResolvedRuntime(installation: installation, source: request.file.path)
-            }
-            throw RuntimeConfigurationError(message: LF("未找到 %@ %@（来自 %@）。请安装该版本或在运行环境中选择已安装版本。", kind.title, request.value, request.file.path))
-        }
         let path = kind == .java ? shell.java : shell.node
         let installation = path.isEmpty ? nil : try? inspect(kind, path: path, directory: directory)
         // Services may only need one runtime (or neither). An absent shell
         // default is informational; an explicit selection is always required.
-        return ResolvedRuntime(installation: installation, source: L("Shell 默认"))
-    }
-
-    static func matches(version: String, request: String, kind: RuntimeKind) -> Bool {
-        var requested = request.hasPrefix("v") ? String(request.dropFirst()) : request
-        var actual = version.hasPrefix("v") ? String(version.dropFirst()) : version
-        if kind == .java {
-            if actual.hasPrefix("1.") { actual = String(actual.dropFirst(2)) }
-            if requested.hasPrefix("1.") { requested = String(requested.dropFirst(2)) }
-        }
-        guard requested.range(of: #"^\d+(?:[._]\d+)*(?:\+\d+)?$"#, options: .regularExpression) != nil else { return false }
-        return actual == requested || actual.hasPrefix(requested + ".") || actual.hasPrefix(requested + "_") || actual.hasPrefix(requested + "+")
+        return ResolvedRuntime(installation: installation, source: L("Shell 默认"), usesShellDefault: true)
     }
 
     private func shellEnvironment(directory: URL, nodeRequest: String? = nil) throws -> ShellEnvironment {
@@ -210,7 +148,7 @@ struct ServiceRuntimeResolver: Sendable {
         builtin printf '\0STACKHUB_RUNTIME\0%s\0%s\0%s\0%s\0%s\0' "$sh_java" "$sh_node" "${NVM_DIR:-$HOME/.nvm}" "${JENV_ROOT:-$HOME/.jenv}" "$sh_requested_node"
         """#, "stackhub-runtime", nodeRequest ?? ""]
         process.currentDirectoryURL = directory
-        process.environment = environment
+        process.environment = ServiceShell.loginEnvironment(environment)
         let output = try RuntimeProbe.run(process, timeout: timeout)
         let marker = "\0STACKHUB_RUNTIME\0"
         guard let start = output.range(of: marker, options: .backwards) else {

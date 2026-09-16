@@ -1,28 +1,39 @@
 import AppKit
 import SwiftUI
 
-/// Keep vertical scroll indicators above the content, without a reserved rail.
+/// Native overlay indicators on either axis, without a reserved rail.
 struct OverlayScrollView<Content: View>: View {
+    var axes: Axis.Set = .vertical
+    var showsIndicators = true
     @ViewBuilder var content: Content
 
     var body: some View {
-        ScrollView(.vertical, showsIndicators: true) {
-            content.background(OverlayScrollerConfigurator())
+        ScrollView(axes, showsIndicators: showsIndicators) {
+            content.background(OverlayScrollerConfigurator(axes: axes, showsIndicators: showsIndicators))
         }
     }
 }
 
 private struct OverlayScrollerConfigurator: NSViewRepresentable {
+    let axes: Axis.Set
+    let showsIndicators: Bool
     func makeNSView(context: Context) -> OverlayScrollerProbeView {
-        OverlayScrollerProbeView(frame: .zero)
+        let probe = OverlayScrollerProbeView(frame: .zero)
+        probe.axes = axes
+        probe.showsIndicators = showsIndicators
+        return probe
     }
 
     func updateNSView(_ nsView: OverlayScrollerProbeView, context: Context) {
+        nsView.axes = axes
+        nsView.showsIndicators = showsIndicators
         nsView.scheduleConfiguration()
     }
 }
 
 final class OverlayScrollerProbeView: NSView {
+    var axes: Axis.Set = .vertical
+    var showsIndicators = true
     private weak var scrollView: NSScrollView?
     private var styleObservation: NSKeyValueObservation?
     private var configurationScheduled = false
@@ -73,7 +84,10 @@ final class OverlayScrollerProbeView: NSView {
         guard let enclosing else { return }
         if enclosing.scrollerStyle != .overlay { enclosing.scrollerStyle = .overlay }
         if !enclosing.autohidesScrollers { enclosing.autohidesScrollers = true }
-        if enclosing.hasHorizontalScroller { enclosing.hasHorizontalScroller = false }
+        let horizontal = showsIndicators && axes.contains(.horizontal)
+        let vertical = showsIndicators && axes.contains(.vertical)
+        if enclosing.hasHorizontalScroller != horizontal { enclosing.hasHorizontalScroller = horizontal }
+        if enclosing.hasVerticalScroller != vertical { enclosing.hasVerticalScroller = vertical }
         if enclosing.drawsBackground { enclosing.drawsBackground = false }
         if enclosing.scrollerKnobStyle != .light { enclosing.scrollerKnobStyle = .light }
     }

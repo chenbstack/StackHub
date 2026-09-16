@@ -43,9 +43,9 @@ Configured ports are freed before a service starts; use only ports belonging to 
 
 ### JDK and Node.js
 
-Expand **Runtime environment** when editing a service. Automatic mode reads the nearest `.java-version`, `.nvmrc`, or `.node-version` from the service directory upward, then uses your shell default if no version file exists. A manual selection takes priority. The panel shows the resolved version, path, and source.
+Expand **Runtime environment** when editing a service. Default mode follows your system shell configuration without reading project version files, overriding runtimes, or logging default runtimes. Select an installed version or custom path to override it; the panel shows the resolved version, path, and source.
 
-JDKs, Homebrew Node.js, and installed jenv/nvm versions are detected locally; custom paths work too. Numeric versions can be matched without a manager; manager aliases such as `lts/*` require an installed version resolvable by that manager. Missing requested versions prevent startup, without downloading or silently choosing another version. Changes apply after restarting the service and do not change other services or your terminal environment.
+JDKs, Homebrew Node.js, and installed jenv/nvm versions are detected locally; custom paths work too. Missing requested versions prevent startup, without downloading or silently choosing another version. Changes apply after restarting the service and do not change other services or your terminal environment.
 
 ## Build from source
 

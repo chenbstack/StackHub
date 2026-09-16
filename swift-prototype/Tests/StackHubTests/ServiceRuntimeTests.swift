@@ -64,11 +64,11 @@ final class ServiceRuntimeTests: XCTestCase {
         func quote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'" }
     }
 
-    func testProjectFilesSelectInstalledRuntimesWithoutVersionManagers() throws {
+    func testDefaultIgnoresProjectVersionFilesAndUsesShell() throws {
         let fixture = try Fixture()
-        let java17 = try fixture.jdk("17.0.12")
+        _ = try fixture.jdk("17.0.12")
         let java21 = try fixture.jdk("21.0.11")
-        let node18 = try fixture.node("18.20.8")
+        _ = try fixture.node("18.20.8")
         let node22 = try fixture.node("22.16.0")
         try fixture.startup(java: java21, node: node22)
         try fixture.file(".java-version", "17\n")
@@ -76,11 +76,12 @@ final class ServiceRuntimeTests: XCTestCase {
         let subdirectory = fixture.project.appendingPathComponent("backend")
         try FileManager.default.createDirectory(at: subdirectory, withIntermediateDirectories: true)
         let resolved = try fixture.resolver.resolve(configuration: .init(), directory: subdirectory)
-        XCTAssertEqual(resolved.java.installation?.path, java17.path)
-        XCTAssertEqual(resolved.node.installation?.path, node18.path)
-        XCTAssertEqual(resolved.java.source, fixture.project.appendingPathComponent(".java-version").path)
-        XCTAssertEqual(resolved.node.source, fixture.project.appendingPathComponent(".nvmrc").path)
-        // The nearest supported version file wins, even if an ancestor has .nvmrc.
+        XCTAssertEqual(resolved.java.installation?.path, java21.path)
+        XCTAssertEqual(resolved.node.installation?.path, node22.path)
+        XCTAssertTrue(resolved.java.usesShellDefault)
+        XCTAssertTrue(resolved.node.usesShellDefault)
+        XCTAssertEqual(resolved.logDescription, "")
+        // Local version files do not override the default environment.
         try fixture.file(".node-version", "22", in: subdirectory)
         XCTAssertEqual(try fixture.resolver.resolve(configuration: .init(), directory: subdirectory).node.installation?.path, node22.path)
     }
@@ -105,15 +106,13 @@ final class ServiceRuntimeTests: XCTestCase {
         let java = try fixture.jdk("21.0.11")
         try fixture.startup(java: java, node: nil)
         try fixture.file(".java-version", "77\n")
-        XCTAssertThrowsError(try fixture.resolver.resolve(configuration: .init(), directory: fixture.project)) {
-            XCTAssertTrue($0.localizedDescription.contains("77"))
-        }
+        XCTAssertEqual(try fixture.resolver.resolve(configuration: .init(), directory: fixture.project).java.installation?.path, java.path)
         let configuration = ServiceRuntimeConfiguration(java: .init(mode: .custom, path: "/missing/jdk"))
         XCTAssertThrowsError(try fixture.resolver.resolve(configuration: configuration, directory: fixture.project)) {
             XCTAssertTrue($0.localizedDescription.contains("/missing/jdk"))
         }
         try fixture.file(".java-version", "$(touch should-not-exist)")
-        XCTAssertThrowsError(try fixture.resolver.resolve(configuration: .init(), directory: fixture.project))
+        XCTAssertNoThrow(try fixture.resolver.resolve(configuration: .init(), directory: fixture.project))
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.project.appendingPathComponent("should-not-exist").path))
     }
 
@@ -133,8 +132,7 @@ final class ServiceRuntimeTests: XCTestCase {
         let command = #"/bin/sh -c 'printf "%s\n" "$JAVA_HOME"; command -v node; printf "%s\n" "$$"'"#
         let originalJavaHome = ProcessInfo.processInfo.environment["JAVA_HOME"]
         for (runtime, java, node) in [(firstResolved, java17, node18), (secondResolved, java21, node22)] {
-            let process = ServiceShell.makeProcess(command: command, directory: fixture.project, runtime: runtime)
-            process.environment = fixture.resolver.environment
+            let process = ServiceShell.makeProcess(command: command, directory: fixture.project, runtime: runtime, environment: fixture.resolver.environment)
             let output = try RuntimeProbe.run(process, timeout: 3).split(separator: "\n").map(String.init)
             XCTAssertEqual(output, [java.path, node.path, String(process.processIdentifier)])
         }
@@ -142,31 +140,23 @@ final class ServiceRuntimeTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.project.appendingPathComponent("pwned").path))
     }
 
-    func testVersionAliasesUseOnlyAlreadyInstalledManagerPaths() throws {
+    func testMixedDefaultAndExplicitRuntimeOnlyLogsAndOverridesExplicitChoice() throws {
         let fixture = try Fixture()
         let java = try fixture.jdk("21.0.11")
         let node = try fixture.node("22.16.0")
-        let versions = fixture.root.appendingPathComponent("jenv/versions")
-        try FileManager.default.createDirectory(at: versions, withIntermediateDirectories: true)
-        try FileManager.default.createSymbolicLink(at: versions.appendingPathComponent("zulu64-21"), withDestinationURL: java)
-        try fixture.file(".java-version", "zulu64-21")
-        try fixture.file(".nvmrc", "lts/*")
-        let nvm = "\nnvm() { [[ $1 == which && $2 == 'lts/*' ]] || return 1; print -r -- \(fixture.quote(node.path)); }\n"
-        let rc = fixture.root.appendingPathComponent(".zshrc")
-        try (String(contentsOf: rc) + nvm).write(to: rc, atomically: true, encoding: .utf8)
-        let result = try fixture.resolver.resolve(configuration: .init(), directory: fixture.project)
-        XCTAssertEqual(result.java.installation?.path, java.path)
-        XCTAssertEqual(result.node.installation?.path, node.path)
-        let catalog = try fixture.resolver.discover(directory: fixture.project)
-        XCTAssertEqual(catalog.filter { $0.kind == .java }.count, 1, "jenv symlink aliases must be deduplicated")
-    }
-
-    func testNumericMatchingDoesNotConfuseMajorVersions() {
-        XCTAssertTrue(ServiceRuntimeResolver.matches(version: "1.8.0_492", request: "8", kind: .java))
-        XCTAssertTrue(ServiceRuntimeResolver.matches(version: "18.20.8", request: "v18.20", kind: .node))
-        XCTAssertFalse(ServiceRuntimeResolver.matches(version: "18.20.8", request: "8", kind: .node))
-        XCTAssertFalse(ServiceRuntimeResolver.matches(version: "21.0.11", request: "17", kind: .java))
-        XCTAssertFalse(ServiceRuntimeResolver.matches(version: "22.16.0", request: "lts/*", kind: .node))
+        try fixture.startup(java: java, node: node)
+        let resolved = try fixture.resolver.resolve(configuration: .init(node: .init(mode: .custom, path: node.path)), directory: fixture.project)
+        XCTAssertTrue(resolved.java.usesShellDefault)
+        XCTAssertFalse(resolved.node.usesShellDefault)
+        XCTAssertFalse(resolved.logDescription.contains("JDK"))
+        XCTAssertTrue(resolved.logDescription.contains("Node.js 22.16.0"))
+        let process = ServiceShell.makeProcess(command: "/usr/bin/true", directory: fixture.project, runtime: resolved)
+        let script = try XCTUnwrap(process.arguments?[1])
+        XCTAssertFalse(script.contains("export JAVA_HOME"))
+        XCTAssertTrue(script.contains("export PATH"))
+        let defaults = try fixture.resolver.resolve(configuration: .init(), directory: fixture.project)
+        let defaultProcess = ServiceShell.makeProcess(command: "/usr/bin/true", directory: fixture.project, runtime: defaults)
+        XCTAssertEqual(defaultProcess.arguments?[1], "exec /usr/bin/true")
     }
 
     func testProbeTimeoutIsBounded() throws {
