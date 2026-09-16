@@ -18,6 +18,7 @@ final class StackHubAppDelegate: NSObject, NSApplicationDelegate {
     private var globalPopoverDismissMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.mainMenu = AppMainMenu.make()
         installStatusItem()
         appUpdater.start()
     }
@@ -289,12 +290,13 @@ struct Service: Identifiable, Codable {
     // An empty list means startup leaves every port untouched. Older saved
     // services used a single `port`; custom decoding migrates it to this list.
     var ports: [Int] = []
+    var runtime = ServiceRuntimeConfiguration()
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, command, url, status, directory, ports, port
+        case id, name, command, url, status, directory, ports, port, runtime
     }
 
-    init(id: String, name: String, command: String, url: String, status: ServiceStatus, directory: String? = nil, ports: [Int] = []) {
+    init(id: String, name: String, command: String, url: String, status: ServiceStatus, directory: String? = nil, ports: [Int] = [], runtime: ServiceRuntimeConfiguration = .init()) {
         self.id = id
         self.name = name
         self.command = command
@@ -302,6 +304,7 @@ struct Service: Identifiable, Codable {
         self.status = status
         self.directory = directory
         self.ports = ports
+        self.runtime = runtime
     }
 
     init(from decoder: Decoder) throws {
@@ -312,6 +315,7 @@ struct Service: Identifiable, Codable {
         url = try container.decode(String.self, forKey: .url)
         status = try container.decode(ServiceStatus.self, forKey: .status)
         directory = try container.decodeIfPresent(String.self, forKey: .directory)
+        runtime = try container.decodeIfPresent(ServiceRuntimeConfiguration.self, forKey: .runtime) ?? .init()
         if let configuredPorts = try container.decodeIfPresent([Int].self, forKey: .ports) {
             ports = configuredPorts
         } else if let legacyPort = try container.decodeIfPresent(Int.self, forKey: .port) {
@@ -330,6 +334,7 @@ struct Service: Identifiable, Codable {
         try container.encode(status, forKey: .status)
         try container.encodeIfPresent(directory, forKey: .directory)
         try container.encode(ports, forKey: .ports)
+        try container.encode(runtime, forKey: .runtime)
     }
 }
 
@@ -669,6 +674,7 @@ final class StackHubStore: ObservableObject {
     @Published var serviceLogs: [String: String] = [:]
     @Published private(set) var loadingStageIDs: Set<String> = []
     private var runningProcesses: [String: Process] = [:]
+    private var preparingServices: [String: Task<Void, Never>] = [:]
     private var intentionallyStoppingServiceIDs: Set<String> = []
     private var restartPendingServiceIDs: Set<String> = []
     private var githubAccessTokenCache: String?
@@ -678,6 +684,7 @@ final class StackHubStore: ObservableObject {
     private var didLoadCredentialBundle = false
     private let defaults: UserDefaults
     private let ciSession: URLSession
+    private let runtimeResolver: ServiceRuntimeResolver
     private let ciCredentialProvider: CICredentialProvider?
     private let ciRefreshScheduler: CIRefreshScheduler
     private var ciRefreshTasks: [CISource: Task<Void, Never>] = [:]
@@ -688,9 +695,11 @@ final class StackHubStore: ObservableObject {
     private var gitLabTimingPollAttempts: [String: Date] = [:]
 
     init(defaults: UserDefaults = .standard, ciSession: URLSession = CIHTTPTransport.session,
-         ciCredentialProvider: CICredentialProvider? = nil, ciRefreshScheduler: CIRefreshScheduler? = nil) {
+         ciCredentialProvider: CICredentialProvider? = nil, ciRefreshScheduler: CIRefreshScheduler? = nil,
+         runtimeResolver: ServiceRuntimeResolver = .init()) {
         self.defaults = defaults
         self.ciSession = ciSession
+        self.runtimeResolver = runtimeResolver
         self.ciCredentialProvider = ciCredentialProvider
         self.ciRefreshScheduler = ciRefreshScheduler ?? CIRefreshScheduler()
         loadPersistedState()
@@ -1951,7 +1960,7 @@ final class StackHubStore: ObservableObject {
 
     func serviceAction(_ service: Service) {
         guard let project = projects.first(where: { $0.services.contains { $0.id == service.id } }) else { return }
-        if runningProcesses[service.id] != nil {
+        if runningProcesses[service.id] != nil || preparingServices[service.id] != nil {
             stopService(service, in: project)
         } else {
             startService(service, in: project)
@@ -1962,6 +1971,7 @@ final class StackHubStore: ObservableObject {
     /// process actually terminates, so the two copies cannot compete for a port.
     func restartService(_ service: Service) {
         guard let project = projects.first(where: { $0.services.contains { $0.id == service.id } }) else { return }
+        preparingServices.removeValue(forKey: service.id)?.cancel()
         guard let process = runningProcesses[service.id], process.isRunning else {
             runningProcesses.removeValue(forKey: service.id)
             startService(service, in: project)
@@ -1974,7 +1984,9 @@ final class StackHubStore: ObservableObject {
     }
 
     func stopAllServices() {
-        guard !runningProcesses.isEmpty else { return }
+        guard !runningProcesses.isEmpty || !preparingServices.isEmpty else { return }
+        for task in preparingServices.values { task.cancel() }
+        preparingServices.removeAll()
         restartPendingServiceIDs.removeAll()
         intentionallyStoppingServiceIDs.formUnion(runningProcesses.keys)
         for process in runningProcesses.values where process.isRunning {
@@ -2022,7 +2034,7 @@ final class StackHubStore: ObservableObject {
         if action == "启动" {
             for service in project.services where runningProcesses[service.id] == nil { startService(service, in: project) }
         } else {
-            for service in project.services where runningProcesses[service.id] != nil { stopService(service, in: project) }
+            for service in project.services where runningProcesses[service.id] != nil || preparingServices[service.id] != nil { stopService(service, in: project) }
         }
     }
 
@@ -2049,7 +2061,8 @@ final class StackHubStore: ObservableObject {
                     url: $0.url.trimmingCharacters(in: .whitespacesAndNewlines),
                     status: .stopped,
                     directory: WorkingDirectory.normalizedOverride($0.directory),
-                    ports: ServicePortGuard.configuredPorts(from: $0.ports) ?? [])
+                    ports: ServicePortGuard.configuredPorts(from: $0.ports) ?? [],
+                    runtime: $0.runtime)
         }
         let project = Project(id: UUID().uuidString, name: trimmedName, initial: String(trimmedName.prefix(1)).uppercased(), serviceCount: services.count, issue: false, isExpanded: true, services: services, directory: (trimmedDirectory as NSString).expandingTildeInPath)
         projects.append(project)
@@ -2085,9 +2098,23 @@ final class StackHubStore: ObservableObject {
                            url: draft.url.trimmingCharacters(in: .whitespacesAndNewlines),
                            status: current?.status ?? .stopped,
                            directory: WorkingDirectory.normalizedOverride(draft.directory),
-                           ports: ServicePortGuard.configuredPorts(from: draft.ports) ?? [])
+                           ports: ServicePortGuard.configuredPorts(from: draft.ports) ?? [],
+                           runtime: draft.runtime)
         }
-        projects[projectIndex] = Project(id: project.id, name: trimmedName, initial: String(trimmedName.prefix(1)).uppercased(), serviceCount: services.count, issue: project.issue, isExpanded: project.isExpanded, services: services, directory: (trimmedDirectory as NSString).expandingTildeInPath)
+        let previouslyPreparingIDs = Set(preparingServices.keys)
+        for previous in project.services {
+            if !services.contains(where: { $0.id == previous.id }) {
+                stopService(previous, in: project)
+            } else if preparingServices[previous.id] != nil {
+                stopService(previous, in: project)
+            }
+        }
+        let savedServices = services.map { service -> Service in
+            var service = service
+            if previouslyPreparingIDs.contains(service.id) { service.status = .stopped }
+            return service
+        }
+        projects[projectIndex] = Project(id: project.id, name: trimmedName, initial: String(trimmedName.prefix(1)).uppercased(), serviceCount: services.count, issue: project.issue, isExpanded: project.isExpanded, services: savedServices, directory: (trimmedDirectory as NSString).expandingTildeInPath)
         persistCIState()
         toast = "已保存项目"
         return true
@@ -2101,6 +2128,7 @@ final class StackHubStore: ObservableObject {
     }
 
     private func startService(_ service: Service, in project: Project) {
+        guard runningProcesses[service.id] == nil, preparingServices[service.id] == nil else { return }
         let directory = WorkingDirectory.resolve(service.directory, projectDirectory: project.directory)
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory), isDirectory.boolValue else {
@@ -2110,6 +2138,28 @@ final class StackHubStore: ObservableObject {
         }
         updateService(service.id, in: project.id, status: .starting)
         serviceLogs[service.id] = ""
+        let resolver = runtimeResolver
+        preparingServices[service.id] = Task { [weak self] in
+            do {
+                let resolution = try await resolver.prepare(configuration: service.runtime, directory: directory)
+                guard !Task.isCancelled, let self else { return }
+                self.preparingServices.removeValue(forKey: service.id)
+                self.serviceLogs[service.id] = resolution.logDescription
+                self.launchService(service, in: project, directory: directory, runtime: resolution)
+            } catch {
+                guard !Task.isCancelled, let self else { return }
+                self.preparingServices.removeValue(forKey: service.id)
+                self.updateService(service.id, in: project.id, status: .failed)
+                self.serviceLogs[service.id] = "[StackHub] \(error.localizedDescription)\n"
+                self.toast = LF("启动失败：%@", error.localizedDescription)
+                self.persistCIState()
+            }
+        }
+    }
+
+    private func launchService(_ service: Service, in project: Project, directory: URL, runtime: ServiceRuntimeResolution) {
+        intentionallyStoppingServiceIDs.remove(service.id)
+        restartPendingServiceIDs.remove(service.id)
         do {
             let releasedByPort = try ServicePortGuard.release(ports: service.ports)
             for port in service.ports {
@@ -2126,13 +2176,9 @@ final class StackHubStore: ObservableObject {
             persistCIState()
             return
         }
-        let process = Process()
+        let process = ServiceShell.makeProcess(command: service.command, directory: directory, runtime: runtime)
+        process.environment = runtimeResolver.environment
         let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        // exec makes the tracked Process the actual command instead of leaving
-        // an intermediate shell around when a service is stopped.
-        process.arguments = ["-lc", "exec \(service.command)"]
-        process.currentDirectoryURL = directory
         process.standardOutput = pipe
         process.standardError = pipe
         pipe.fileHandleForReading.readabilityHandler = { [weak self, weak process] handle in
@@ -2141,6 +2187,7 @@ final class StackHubStore: ObservableObject {
             Task { @MainActor [weak self, weak process] in
                 guard let self, let process else { return }
                 if let current = self.runningProcesses[service.id], current !== process { return }
+                if self.preparingServices[service.id] != nil { return }
                 self.serviceLogs[service.id, default: ""].append(chunk)
                 guard self.runningProcesses[service.id] === process else { return }
                 self.applyStartupEvidence(
@@ -2154,16 +2201,18 @@ final class StackHubStore: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 pipe.fileHandleForReading.readabilityHandler = nil
+                if let current = self.runningProcesses[service.id], current !== process { return }
+                if self.preparingServices[service.id] != nil { return }
                 let wasIntentionallyStopped = self.intentionallyStoppingServiceIDs.remove(service.id) != nil
                 let shouldRestart = self.restartPendingServiceIDs.remove(service.id) != nil
-                if let current = self.runningProcesses[service.id], current !== process {
-                    return
-                }
                 self.runningProcesses.removeValue(forKey: service.id)
                 if shouldRestart {
                     self.updateService(service.id, in: project.id, status: .starting)
                     self.persistCIState()
-                    self.startService(service, in: project)
+                    if let currentProject = self.projects.first(where: { $0.id == project.id }),
+                       let currentService = currentProject.services.first(where: { $0.id == service.id }) {
+                        self.startService(currentService, in: currentProject)
+                    }
                     return
                 }
                 let status: ServiceStatus = wasIntentionallyStopped || process.terminationStatus == 0 ? .stopped : .failed
@@ -2181,6 +2230,7 @@ final class StackHubStore: ObservableObject {
     }
 
     private func stopService(_ service: Service, in project: Project) {
+        preparingServices.removeValue(forKey: service.id)?.cancel()
         restartPendingServiceIDs.remove(service.id)
         if runningProcesses[service.id] != nil {
             intentionallyStoppingServiceIDs.insert(service.id)

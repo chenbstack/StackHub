@@ -186,7 +186,8 @@ final class ServiceDirectoryTests: XCTestCase {
             defaults.removePersistentDomain(forName: suite)
             try? FileManager.default.removeItem(at: root)
         }
-        let store = StackHubStore(defaults: defaults)
+        let resolver = try isolatedRuntimeResolver(in: root)
+        let store = StackHubStore(defaults: defaults, runtimeResolver: resolver)
         // Each real child process writes its actual cwd using the same relative
         // output filename. Distinct files prove the launch directory is applied.
         let command = "/bin/sh -c 'pwd -P > .stackhub-cwd'"
@@ -195,7 +196,7 @@ final class ServiceDirectoryTests: XCTestCase {
             ProjectServiceDraft(name: "Backend", command: command, directory: backend.path),
             ProjectServiceDraft(name: "Inherited", command: command)
         ]))
-        let reloadedStore = StackHubStore(defaults: defaults)
+        let reloadedStore = StackHubStore(defaults: defaults, runtimeResolver: resolver)
         let project = try XCTUnwrap(reloadedStore.projects.first)
         defer { reloadedStore.projectAction(project, action: "停止") }
         reloadedStore.projectAction(project, action: "启动")
@@ -256,7 +257,8 @@ final class ServiceDirectoryTests: XCTestCase {
             defaults.removePersistentDomain(forName: suite)
             try? FileManager.default.removeItem(at: directory)
         }
-        let store = StackHubStore(defaults: defaults)
+        let resolver = try isolatedRuntimeResolver(in: directory)
+        let store = StackHubStore(defaults: defaults, runtimeResolver: resolver)
         XCTAssertTrue(store.addProject(name: "Logs", directory: directory.path, services: [
             ProjectServiceDraft(name: "API", command: "/bin/sh -c 'printf stdout; printf stderr >&2'")
         ]))
@@ -287,10 +289,11 @@ final class ServiceDirectoryTests: XCTestCase {
             defaults.removePersistentDomain(forName: suite)
             try? FileManager.default.removeItem(at: directory)
         }
-        let store = StackHubStore(defaults: defaults)
+        let resolver = try isolatedRuntimeResolver(in: directory)
+        let store = StackHubStore(defaults: defaults, runtimeResolver: resolver)
         XCTAssertTrue(store.addProject(name: "Readiness", directory: directory.path, services: [
-            ProjectServiceDraft(name: "Ready", command: "/bin/sh -c 'echo \"Server listening on http://127.0.0.1:3000\"; sleep 60'"),
-            ProjectServiceDraft(name: "Warning", command: "/bin/sh -c 'echo \"ERROR: unable to bind port\" >&2; sleep 60'")
+            ProjectServiceDraft(name: "Ready", command: "/bin/sh -c 'echo \"Server listening on http://127.0.0.1:3000\"; exec sleep 60'"),
+            ProjectServiceDraft(name: "Warning", command: "/bin/sh -c 'echo \"ERROR: unable to bind port\" >&2; exec sleep 60'")
         ]))
         let services = store.projects[0].services
         for service in services { store.serviceAction(service) }
@@ -316,9 +319,10 @@ final class ServiceDirectoryTests: XCTestCase {
             defaults.removePersistentDomain(forName: suite)
             try? FileManager.default.removeItem(at: directory)
         }
-        let store = StackHubStore(defaults: defaults)
+        let resolver = try isolatedRuntimeResolver(in: directory)
+        let store = StackHubStore(defaults: defaults, runtimeResolver: resolver)
         XCTAssertTrue(store.addProject(name: "Restart", directory: directory.path, services: [
-            ProjectServiceDraft(name: "Server", command: "/bin/sh -c 'echo ready; sleep 60'")
+            ProjectServiceDraft(name: "Server", command: "/bin/sh -c 'echo ready; exec sleep 60'")
         ]))
         let service = try XCTUnwrap(store.projects.first?.services.first)
         store.serviceAction(service)
@@ -365,7 +369,8 @@ final class ServiceDirectoryTests: XCTestCase {
             defaults.removePersistentDomain(forName: suite)
             try? FileManager.default.removeItem(at: directory)
         }
-        let store = StackHubStore(defaults: defaults)
+        let resolver = try isolatedRuntimeResolver(in: directory)
+        let store = StackHubStore(defaults: defaults, runtimeResolver: resolver)
         XCTAssertTrue(store.addProject(name: "Long running", directory: directory.path, services: [
             ProjectServiceDraft(name: "Server", command: "/bin/sleep 60")
         ]))
@@ -377,5 +382,20 @@ final class ServiceDirectoryTests: XCTestCase {
         XCTAssertEqual(store.projects[0].services[0].status, .stopped)
         try await Task.sleep(nanoseconds: 50_000_000)
         XCTAssertEqual(StackHubStore(defaults: defaults).projects[0].services[0].status, .stopped)
+    }
+
+    /// Lifecycle tests exercise real processes without depending on the user's
+    /// startup scripts or installed runtimes. ServiceShellTests separately
+    /// verify startup-file loading, and ServiceRuntimeTests cover selection.
+    private func isolatedRuntimeResolver(in directory: URL) throws -> ServiceRuntimeResolver {
+        let shellDirectory = directory.appendingPathComponent("test-shell")
+        try FileManager.default.createDirectory(at: shellDirectory, withIntermediateDirectories: true)
+        try "export PATH=/usr/bin:/bin\nexport JAVA_HOME=/uninstalled-test-jdk\n"
+            .write(to: shellDirectory.appendingPathComponent(".zshrc"), atomically: true, encoding: .utf8)
+        var environment = ProcessInfo.processInfo.environment
+        environment["ZDOTDIR"] = shellDirectory.path
+        environment["JENV_ROOT"] = shellDirectory.appendingPathComponent("jenv").path
+        environment["NVM_DIR"] = shellDirectory.appendingPathComponent("nvm").path
+        return ServiceRuntimeResolver(environment: environment, home: shellDirectory, javaRoots: [], nodeRoots: [])
     }
 }

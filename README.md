@@ -23,7 +23,8 @@ StackHub is a native macOS menu bar app built with SwiftUI. Run commands and she
 
 ## Features
 
-- **Local services** — Start, stop, and restart project services with custom commands, working directories, and ports.
+- **Local services** — Start, stop, and restart project services with custom commands, working directories, and ports. Commands load your `.zshrc` so tools such as jenv and nvm can configure the environment.
+- **Per-service runtimes** — Select an installed JDK or Node.js version, or specify a custom path. No version manager required.
 - **Live logs** — View service output with ANSI colors in a dedicated log view.
 - **CI monitoring** — Follow GitHub Actions and multiple GitLab instances. Each refreshes independently and keeps cached results when offline.
 - **Secure credentials** — Store GitHub and GitLab tokens in macOS Keychain.
@@ -39,6 +40,12 @@ Requires **macOS 14 or later**. Release downloads are for **Apple Silicon**.
 3. Launch StackHub and click its menu bar icon. Add local services in **Projects**, or connect GitHub and GitLab in **CI**.
 
 Configured ports are freed before a service starts; use only ports belonging to that service. Quitting or installing an update stops managed services; start them again when needed.
+
+### JDK and Node.js
+
+Expand **Runtime environment** when editing a service. Automatic mode reads the nearest `.java-version`, `.nvmrc`, or `.node-version` from the service directory upward, then uses your shell default if no version file exists. A manual selection takes priority. The panel shows the resolved version, path, and source.
+
+JDKs, Homebrew Node.js, and installed jenv/nvm versions are detected locally; custom paths work too. Numeric versions can be matched without a manager; manager aliases such as `lts/*` require an installed version resolvable by that manager. Missing requested versions prevent startup, without downloading or silently choosing another version. Changes apply after restarting the service and do not change other services or your terminal environment.
 
 ## Build from source
 

@@ -19,6 +19,13 @@
 "StackHub · 菜单栏" = "StackHub · Menu Bar";
 "退出" = "Quit";
 "退出 StackHub" = "Quit StackHub";
+"编辑" = "Edit";
+"撤销" = "Undo";
+"重做" = "Redo";
+"剪切" = "Cut";
+"复制" = "Copy";
+"粘贴" = "Paste";
+"全选" = "Select All";
 "管理 CI 实例" = "Manage CI instances";
 "实例管理" = "Instance management";
 "管理 GitHub 授权和 GitLab 实例" = "Manage GitHub authorization and GitLab instances";
@@ -279,3 +286,32 @@
 "检测全部" = "Check all";
 "重新检测连接" = "Check connection again";
 "检测于 %@" = "Checked at %@";
+
+// Per-service runtimes
+"运行环境" = "Runtime environment";
+"自动（项目配置 / Shell 默认）" = "Automatic (project / shell default)";
+"已安装版本" = "Installed version";
+"自定义路径" = "Custom path";
+"Shell 默认" = "Shell default";
+"优先使用手动选择，其次读取项目版本文件，最后沿用 Shell 默认。修改后重启服务生效。" = "Uses your selection, then project version files, then the shell default. Restart the service to apply changes.";
+"正在检测运行环境…" = "Detecting runtimes…";
+"仅使用已安装版本，不自动下载" = "Uses installed versions; no automatic downloads";
+"重新检测运行环境" = "Refresh runtimes";
+"请选择版本" = "Choose a version";
+"当前路径：%@" = "Current path: %@";
+"JDK 主目录或 .jdk 目录" = "JDK home or .jdk directory";
+"Node 可执行文件路径" = "Node executable path";
+"%@ 自定义路径" = "%@ custom path";
+"选择运行时路径" = "Choose runtime path";
+"选择 %@ 路径" = "Choose %@ path";
+"来源：%@" = "Source: %@";
+"Shell 中未检测到 %@（仅在服务需要时配置）" = "%@ not found in the shell (configure only if needed)";
+"版本文件无效：%@" = "Invalid version file: %@";
+"请选择 %@ 的已安装版本或路径" = "Select an installed %@ version or path";
+"未找到 %@ %@（来自 %@）。请安装该版本或在运行环境中选择已安装版本。" = "%@ %@ from %@ was not found. Install it or select an installed version in Runtime environment.";
+"无法读取 Shell 环境，请检查 .zshrc" = "Cannot read the shell environment. Check .zshrc.";
+"%@ 路径不可用：%@" = "%@ path is unavailable: %@";
+"%@ 路径不是完整 JDK：%@" = "%@ path is not a complete JDK: %@";
+"无法识别 %@ 版本：%@" = "Cannot determine the %@ version: %@";
+"运行环境检测超时，请检查 Shell 启动配置和运行时路径" = "Runtime detection timed out. Check shell startup files and runtime paths.";
+"运行环境检测失败，请检查 Shell 启动配置和运行时路径" = "Runtime detection failed. Check shell startup files and runtime paths.";

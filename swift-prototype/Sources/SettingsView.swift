@@ -12,14 +12,16 @@ struct ProjectServiceDraft: Identifiable {
     /// An empty value means StackHub must not inspect or touch any port.
     /// Multiple ports use a comma, such as `3000, 5173`.
     var ports: String
+    var runtime: ServiceRuntimeConfiguration
 
-    init(id: String = UUID().uuidString, name: String = "服务", command: String = "", url: String = "", directory: String = "", ports: String = "") {
+    init(id: String = UUID().uuidString, name: String = "服务", command: String = "", url: String = "", directory: String = "", ports: String = "", runtime: ServiceRuntimeConfiguration = .init()) {
         self.id = id
         self.name = name
         self.command = command
         self.url = url
         self.directory = directory
         self.ports = ports
+        self.runtime = runtime
     }
 }
 
@@ -41,7 +43,8 @@ final class ProjectDraft: ObservableObject {
                 command: $0.command,
                 url: $0.url,
                 directory: $0.directory ?? "",
-                ports: $0.ports.map(String.init).joined(separator: ", ")
+                ports: $0.ports.map(String.init).joined(separator: ", "),
+                runtime: $0.runtime
             )
         }
             ?? [ProjectServiceDraft()]
@@ -441,6 +444,10 @@ private struct ProjectInlineEditor: View {
                         Text("例如 3000, 5173；启动前会终止占用这些 TCP 端口的进程。")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
+                        ServiceRuntimeEditor(
+                            configuration: $service.runtime,
+                            directory: WorkingDirectory.resolve(service.directory, projectDirectory: draft.directory)
+                        )
                     }
                     .padding(10)
                     .background(Color.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 11))
