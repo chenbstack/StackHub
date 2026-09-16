@@ -151,15 +151,19 @@ final class CIRefreshIsolationTests: XCTestCase {
             default: return .json("[]")
             }
         }
-        for _ in 0..<3 {
+        for _ in 0..<12 {
+            let before = fixture.router.requests.count
             fixture.store.refreshCI()
             try await eventually { !fixture.store.isRefreshingCI }
+            XCTAssertLessThanOrEqual(fixture.router.requests.dropFirst(before).filter {
+                $0.url!.path.hasPrefix("/api/v4/projects/") && $0.url!.path.hasSuffix("/pipelines")
+            }.count, 10)
         }
         let paths = Set(fixture.router.requests.map { $0.url!.path })
         for id in 1...26 {
             XCTAssertTrue(paths.contains("/api/v4/projects/\(id)/pipelines"), "Project \(id) must eventually be polled")
         }
-        XCTAssertEqual(fixture.router.requests.filter { $0.url!.path == "/api/v4/projects" }.count, 3)
+        XCTAssertEqual(fixture.router.requests.filter { $0.url!.path == "/api/v4/projects" }.count, 12)
         XCTAssertTrue(fixture.store.ciError == nil || fixture.store.ciError!.contains("403"))
     }
 
@@ -178,6 +182,79 @@ final class CIRefreshIsolationTests: XCTestCase {
         XCTAssertEqual(fixture.store.pipelineCache.count, 8)
         XCTAssertTrue(fixture.store.ciError?.contains("office") == true)
         XCTAssertTrue(fixture.router.requests.allSatisfy { $0.timeoutInterval == 3 })
+    }
+
+    @MainActor
+    func testInitialGitLabSyncBoundsIndexPipelinesAndStepRequests() async throws {
+        let online = instance("online")
+        let fixture = makeFixture(instances: [online])
+        defer { fixture.cleanUp() }
+        fixture.router.respond { request in
+            let path = request.url!.path
+            if path == "/api/v4/pipelines" { return .http(404) }
+            if path == "/api/v4/projects" {
+                return .json(self.gitLabProjectListJSON(Array(1...100), activity: "2026-09-16T04:15:00.000Z"))
+            }
+            if path.hasSuffix("/jobs") { return .json("[]") }
+            if path.hasSuffix("/pipelines"), let id = Int(path.split(separator: "/")[3]) {
+                return .json(self.gitLabPipelineJSON(project: id, run: id))
+            }
+            return .http(500)
+        }
+        for _ in 0..<7 {
+            let before = fixture.router.requests.count
+            fixture.store.refreshCI()
+            try await eventually { !fixture.store.isRefreshingCI }
+            let requests = Array(fixture.router.requests.dropFirst(before))
+            XCTAssertEqual(requests.filter { $0.url!.path == "/api/v4/projects" }.count, 1)
+            XCTAssertEqual(requests.filter { $0.url!.path.hasPrefix("/api/v4/projects/") && $0.url!.path.hasSuffix("/pipelines") }.count, 10)
+            XCTAssertLessThanOrEqual(requests.filter { $0.url!.path.hasSuffix("/jobs") }.count, 4)
+            XCTAssertLessThanOrEqual(fixture.store.recentCIActivities.count, 20)
+            XCTAssertEqual(fixture.store.accessibleCIProjects.count, 30)
+            XCTAssertNil(fixture.store.ciError)
+        }
+        XCTAssertEqual(fixture.store.recentCIActivities.count, 20)
+        XCTAssertGreaterThan(fixture.store.pipelineCache.count, 20, "Display limits do not erase cached history")
+        let index = try XCTUnwrap(fixture.router.requests.first { $0.url!.path == "/api/v4/projects" }?.url)
+        XCTAssertTrue(URLComponents(url: index, resolvingAgainstBaseURL: false)!.queryItems!.contains {
+            $0.name == "per_page" && $0.value == "30"
+        })
+    }
+
+    @MainActor
+    func testGlobalFeedBoundsMetadataAndRunningChecksWithoutLosingDeferredProjects() async throws {
+        let online = instance("online")
+        let fixture = makeFixture(instances: [online])
+        defer { fixture.cleanUp() }
+        let feed = "[" + (1...20).map {
+            String(gitLabPipelineJSON(project: $0, run: $0).dropFirst().dropLast())
+        }.joined(separator: ",") + "]"
+        fixture.router.respond { request in
+            let path = request.url!.path
+            if path == "/api/v4/pipelines" { return .json(feed) }
+            if path.hasSuffix("/jobs") { return .json("[]") }
+            let parts = path.split(separator: "/")
+            guard parts.count >= 4, let id = Int(parts[3]) else { return .http(500) }
+            if parts.count == 4 {
+                return .json(String(self.gitLabProjectListJSON([id]).dropFirst().dropLast()))
+            }
+            return .json(String(self.gitLabPipelineJSON(project: id, run: id).dropFirst().dropLast()))
+        }
+        for cycle in 0..<3 {
+            let before = fixture.router.requests.count
+            fixture.store.refreshCI()
+            try await eventually { !fixture.store.isRefreshingCI }
+            let requests = Array(fixture.router.requests.dropFirst(before))
+            XCTAssertLessThanOrEqual(requests.filter { $0.url!.path.split(separator: "/").count == 4 }.count, 10)
+            XCTAssertLessThanOrEqual(requests.filter { $0.url!.path.split(separator: "/").count == 6 }.count, 10)
+            XCTAssertLessThanOrEqual(requests.filter { $0.url!.path.hasSuffix("/jobs") }.count, 4)
+            XCTAssertLessThanOrEqual(fixture.store.recentCIActivities.count, 20)
+            XCTAssertNil(fixture.store.ciError)
+            let cursors = try JSONDecoder().decode([String: Date].self, from: XCTUnwrap(fixture.defaults.data(forKey: "stackhub.ci.gitlab-pipeline-sync-dates")))
+            if cycle < 1 { XCTAssertNil(cursors[online.id.uuidString], "Do not skip metadata left for a later cycle") }
+            else { XCTAssertNotNil(cursors[online.id.uuidString]) }
+        }
+        XCTAssertEqual(fixture.store.pipelineCache.count, 20)
     }
 
     @MainActor
@@ -220,6 +297,92 @@ final class CIRefreshIsolationTests: XCTestCase {
         try await eventually { !fixture.store.isRefreshingCI }
         XCTAssertEqual(fixture.store.pipelineCache.count, 1)
         XCTAssertTrue(fixture.store.ciError?.contains("GitHub") == true)
+    }
+
+    @MainActor
+    func testGitHubFullAndIncrementalRefreshStayWithinFiveRepositories() async throws {
+        let fixture = makeFixture(instances: [], githubToken: "test-token")
+        defer { fixture.cleanUp() }
+        for cycle in 0..<3 {
+            let firstID = cycle == 0 ? 1 : 21
+            let repositories = cycle == 2 ? "[]" : "[" + (firstID..<(firstID + 20)).map { id in
+                """
+                {"name":"repo\(id)","full_name":"owner/repo\(id)","default_branch":"main","updated_at":"2026-09-\(cycle == 0 ? "15" : "16")T10:00:00Z"}
+                """
+            }.joined(separator: ",") + "]"
+            fixture.router.respond { request in
+                if request.url!.path == "/user/repos" { return .json(repositories) }
+                if request.url!.path.hasSuffix("/actions/runs") { return .json("{\"workflow_runs\":[]}") }
+                return .http(500)
+            }
+            let before = fixture.router.requests.count
+            fixture.store.refreshCI()
+            try await eventually { !fixture.store.isRefreshingCI }
+            let requests = Array(fixture.router.requests.dropFirst(before))
+            let indexes = requests.filter { $0.url!.path == "/user/repos" }
+            XCTAssertEqual(indexes.count, 1)
+            let index = try XCTUnwrap(indexes.first?.url)
+            let query = URLComponents(url: index, resolvingAgainstBaseURL: false)!.queryItems!
+            XCTAssertTrue(query.contains { $0.name == "per_page" && $0.value == "5" })
+            XCTAssertEqual(query.contains { $0.name == "since" }, cycle != 0)
+            let runs = requests.filter { $0.url!.path.hasSuffix("/actions/runs") }
+            XCTAssertEqual(runs.count, 5)
+            XCTAssertEqual(Set(runs.map { $0.url!.path }), Set((firstID..<(firstID + 5)).map {
+                "/repos/owner/repo\($0)/actions/runs"
+            }))
+            XCTAssertEqual(fixture.store.accessibleCIProjects.count, 5)
+            XCTAssertNil(fixture.store.ciError)
+        }
+    }
+
+    @MainActor
+    func testRefreshTicksAndManualClicksDoNotOverlapPendingDetailLoads() async throws {
+        let office = instance("office")
+        var now = Date()
+        let scheduler = CIRefreshScheduler(now: { now })
+        let fixture = makeFixture(instances: [office], scheduler: scheduler, githubToken: "test-token")
+        defer { fixture.cleanUp() }
+        fixture.router.respond { request in
+            if request.url!.path.hasSuffix("/jobs") { return .hold }
+            if request.url!.host == "office.test" { return .json(self.pipelineJSON()) }
+            if request.url!.path == "/user/repos" { return .json(self.githubRepositoryJSON) }
+            return .json(self.githubRunsJSON(status: "completed", conclusion: "success"))
+        }
+        fixture.store.refreshCIIfNeeded()
+        try await eventually { fixture.router.requests.filter { $0.url!.path.hasSuffix("/jobs") }.count == 2 }
+        let before = fixture.router.requests.count
+        for _ in 0..<3 {
+            now.addTimeInterval(60)
+            fixture.store.refreshCIIfNeeded()
+            fixture.store.refreshCI()
+            fixture.store.refreshCI(forceProjectDiscovery: true)
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(fixture.router.requests.count, before, "Skip both manual and automatic refreshes until details finish")
+        XCTAssertTrue(scheduler.isRefreshing(.github))
+        XCTAssertTrue(scheduler.isRefreshing(.gitlab(office.id)))
+
+        fixture.router.respond { request in
+            if request.url!.host == "office.test" { return .hold }
+            if request.url!.path == "/user/repos" { return .json("[]") }
+            if request.url!.path.hasSuffix("/jobs") { return .json(self.githubJobsJSON()) }
+            return .json(self.githubRunsJSON(status: "completed", conclusion: "success"))
+        }
+        fixture.router.releaseHeld(host: "api.github.com", result: .json(githubJobsJSON()))
+        try await eventually { !scheduler.isRefreshing(.github) }
+        fixture.store.refreshCIIfNeeded()
+        XCTAssertEqual(fixture.router.requests.count, before, "Skipped refreshes must not queue behind the current round")
+
+        now.addTimeInterval(31)
+        fixture.store.refreshCIIfNeeded()
+        try await eventually {
+            fixture.router.requests.count > before && !scheduler.isRefreshing(.github)
+        }
+        XCTAssertEqual(fixture.router.count(host: "office.test"), 2, "A finished source can refresh while another is still waiting")
+        fixture.router.releaseHeld(host: "office.test", result: .json("[]"))
+        try await eventually { !fixture.store.isRefreshingCI }
+        XCTAssertEqual(fixture.router.count(host: "api.github.com"), 5)
+        XCTAssertNil(fixture.store.ciError)
     }
 
     @MainActor

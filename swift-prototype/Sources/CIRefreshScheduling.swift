@@ -72,6 +72,8 @@ final class CIRefreshScheduler {
 
     func begin(_ source: CISource, manual: Bool) -> UUID? {
         var state = states[source] ?? State()
+        // Skip overlapping ticks and manual clicks; do not queue another round.
+        // The source stays busy until its summaries and detail prefetch finish.
         guard state.requestID == nil, manual || now() >= state.nextAutomaticRefresh else { return nil }
         let id = UUID()
         state.requestID = id

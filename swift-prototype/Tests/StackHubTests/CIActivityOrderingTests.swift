@@ -3,7 +3,7 @@ import XCTest
 @testable import StackHub
 
 final class CIActivityOrderingTests: XCTestCase {
-    func testGitLabNewActivityFollowedAndRunningProjectsAreNotCutOffByBatchLimit() {
+    func testGitLabUrgentProjectsShareHardLimitAndKeepPriority() {
         let projects = (1...30).map { project("gitlab:one:\($0)", provider: "GitLab CI", timestamp: 200) }
         var successes = Dictionary(uniqueKeysWithValues: projects.map { ($0.id, Date(timeIntervalSince1970: 300)) })
         // More than eight repositories changed since their previous poll.
@@ -15,10 +15,43 @@ final class CIActivityOrderingTests: XCTestCase {
             followedIDs: [projects[29].id], successfulPolls: successes, attemptedPolls: [:], batchSize: 8
         )
         let ids = Set(result.map(\.id))
-        XCTAssertTrue(Set(projects[8..<20].map(\.id)).isSubset(of: ids))
+        XCTAssertEqual(result.count, 8, "Urgent work must not expand the batch")
         XCTAssertTrue(ids.contains(running.id))
         XCTAssertTrue(ids.contains(projects[29].id))
         XCTAssertEqual(result.count, ids.count, "Each project is only requested once per cycle")
+    }
+
+    func testBusyGitLabProjectsCannotStarveBackgroundProjects() {
+        let projects = (1...100).map { project("gitlab:one:\($0)", provider: "GitLab CI", timestamp: 200) }
+        let followed = Set(projects.prefix(30).map(\.id))
+        var attempts: [String: Date] = [:]
+        var successes: [String: Date] = [:]
+        var visited = Set<String>()
+        for cycle in 0..<50 {
+            let batch = CIActivityOrdering.gitLabProjectsRequiringPipelineRefresh(
+                projects: projects, pipelineCache: [:], followedIDs: followed,
+                successfulPolls: successes, attemptedPolls: attempts, batchSize: 8
+            )
+            XCTAssertLessThanOrEqual(batch.count, 8)
+            XCTAssertEqual(batch.count, Set(batch.map(\.id)).count)
+            for repository in batch {
+                attempts[repository.id] = Date(timeIntervalSince1970: Double(300 + cycle))
+                // Some failed requests never advance their successful cursor.
+                if repository.id != projects[0].id { successes[repository.id] = attempts[repository.id] }
+                visited.insert(repository.id)
+            }
+        }
+        XCTAssertEqual(visited, Set(projects.map(\.id)))
+    }
+
+    func testActivityListKeepsOnlyTwentyLatestProjectsWithoutDiscardingCachedHistory() {
+        let projects = (1...100).map { project("gitlab:one:\($0)", provider: "GitLab CI") }
+        let cache = Dictionary(uniqueKeysWithValues: projects.enumerated().map { index, repository in
+            (repository.id, [pipeline("run-\(index)", project: repository, timestamp: Double(index))])
+        })
+        let result = CIActivityOrdering.latestActivities(projects: projects, pipelineCache: cache)
+        XCTAssertEqual(result.map(\.id), projects.suffix(20).reversed().map(\.id))
+        XCTAssertEqual(cache.count, 100)
     }
 
     func testExecutionDurationFormattingIsCompactAndProviderIndependent() {

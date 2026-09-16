@@ -73,6 +73,9 @@
 "GitHub 授权失败：%@" = "GitHub authorization failed: %@";
 "GitHub 返回 HTTP %ld" = "GitHub returned HTTP %ld";
 "已关注 %@" = "Following %@";
+"最多关注 %ld 个项目，请先取消一个关注。" = "You can follow up to %ld projects. Unfollow one first.";
+"管理关注项目" = "Manage followed projects";
+"取消关注 %@" = "Unfollow %@";
 "已取消关注 %@" = "Unfollowed %@";
 "访问地址无效：%@" = "Invalid service URL: %@";
 "已添加项目 %@" = "Added project %@";
@@ -188,8 +191,8 @@
 "添加关注项目" = "Add followed project";
 "没有可添加的项目；下方列表中的项目都已关注。" = "There are no projects to add; every project in the list below is already followed.";
 "关注" = "Follow";
-"全部流水线" = "All pipelines";
-"来自已连接账号触发的最近活动；关注项目后会在上方持续跟踪最近 5 条。" = "Recent activity from connected accounts. Followed projects keep their latest five runs above.";
+"最近流水线" = "Recent pipelines";
+"显示最近 20 个项目的流水线；关注项目会在上方保留最近 5 条。" = "Latest pipelines from 20 projects. Followed projects keep their latest five runs above.";
 "正在同步流水线" = "Syncing pipelines";
 "先连接 CI 账号" = "Connect a CI account first";
 "打开 CI 页面后会自动加载你有权限查看的项目和流水线。" = "Opening the CI page automatically loads projects and pipelines that you can access.";

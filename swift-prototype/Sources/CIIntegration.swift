@@ -173,7 +173,7 @@ struct RemoteJob: Identifiable, Decodable {
 final class GitHubAPIClient {
     /// GitHub has no cross-repository Actions feed, so keep the sync scope small.
     /// Repositories are returned newest-first by the API's `updated` sort.
-    static let recentRepositoryLimit = 8
+    static let recentRepositoryLimit = 5
 
     private let token: String
     private let session: URLSession
@@ -360,7 +360,8 @@ private struct GitHubJob: Decodable {
 final class GitLabAPIClient {
     /// Bound the regular and background polling batches when the instance
     /// does not expose `/pipelines` (including GitLab 19.3.2).
-    static let legacyFallbackProjectLimit = 8
+    static let legacyFallbackProjectLimit = 10
+    static let recentProjectLimit = 30
 
     private let baseURL: URL
     private let token: String
@@ -406,37 +407,19 @@ final class GitLabAPIClient {
         let _: CIAuthenticatedUser = try await send(makeURL(path: "/api/v4/user"), cachePolicy: .reloadIgnoringLocalCacheData)
     }
 
-    func accessibleProjects() async throws -> [RemoteProject] {
-        var response: [GitLabProject] = []
-        for page in 1...10 {
-            let url = try makeURL(path: "/api/v4/projects", query: [
-                URLQueryItem(name: "membership", value: "true"),
-                URLQueryItem(name: "per_page", value: "100"),
-                URLQueryItem(name: "page", value: "\(page)"),
-                URLQueryItem(name: "order_by", value: "last_activity_at"),
-                URLQueryItem(name: "sort", value: "desc")
-            ])
-            let batch: [GitLabProject] = try await send(url)
-            response.append(contentsOf: batch)
-            if batch.count < 100 { break }
-        }
-        let prefix = projectIDPrefix ?? baseURL.host ?? "instance"
-        return response.map { makeRemoteProject($0, prefix: prefix) }
-    }
-
     /// Refresh the activity ordering with one request on every compatibility
     /// poll. A persisted index alone cannot discover pushes to older projects.
     func recentlyActiveProjects() async throws -> [RemoteProject] {
         let url = try makeURL(path: "/api/v4/projects", query: [
             URLQueryItem(name: "membership", value: "true"),
-            URLQueryItem(name: "per_page", value: "100"),
+            URLQueryItem(name: "per_page", value: "\(Self.recentProjectLimit)"),
             URLQueryItem(name: "page", value: "1"),
             URLQueryItem(name: "order_by", value: "last_activity_at"),
             URLQueryItem(name: "sort", value: "desc")
         ])
         let response: [GitLabProject] = try await send(url)
         let prefix = projectIDPrefix ?? baseURL.host ?? "instance"
-        return response.map { makeRemoteProject($0, prefix: prefix) }
+        return response.prefix(Self.recentProjectLimit).map { makeRemoteProject($0, prefix: prefix) }
     }
 
     /// GitLab 的全局流水线活动接口。它一次返回多个项目的近期流水线，

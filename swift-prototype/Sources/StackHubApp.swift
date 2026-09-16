@@ -588,7 +588,8 @@ final class StackHubStore: ObservableObject {
 
     private static let projectIndexOrderVersion = 1
     private static let projectIndexOrderVersionKey = "stackhub.ci.index-order-version"
-    private static let stagePrefetchProjectLimit = 8
+    private static let stagePrefetchProjectLimit = 4
+    private static let timingPrefetchProjectLimit = 2
     private static let githubRepositoryLimit = GitHubAPIClient.recentRepositoryLimit
     private static let githubFullDiscoveryInterval: TimeInterval = 24 * 60 * 60
     private static let pipelineCacheKey = "stackhub.ci.pipeline-cache"
@@ -604,6 +605,7 @@ final class StackHubStore: ObservableObject {
     private static let githubConnectedMetadataKey = "stackhub.github.connected"
     private static let credentialBundleAccount = "ci.credentials.v1"
     static let ciRefreshInterval: TimeInterval = 30
+    static let followedCIProjectLimit = 5
 
     @Published var tab: PanelTab = .projects
     @Published var projects: [Project] = []
@@ -682,6 +684,8 @@ final class StackHubStore: ObservableObject {
     private var ciSourceErrors: [CISource: String] = [:]
     private var offlineCISources: Set<CISource> = []
     private var gitLabProjectPollAttempts: [String: Date] = [:]
+    private var gitLabRunningPollAttempts: [String: Date] = [:]
+    private var gitLabTimingPollAttempts: [String: Date] = [:]
 
     init(defaults: UserDefaults = .standard, ciSession: URLSession = CIHTTPTransport.session,
          ciCredentialProvider: CICredentialProvider? = nil, ciRefreshScheduler: CIRefreshScheduler? = nil) {
@@ -963,6 +967,12 @@ final class StackHubStore: ObservableObject {
         gitLabProjectPollAttempts = gitLabProjectPollAttempts.filter {
             !CISource.gitlab(instanceID).contains(projectID: $0.key)
         }
+        gitLabRunningPollAttempts = gitLabRunningPollAttempts.filter {
+            !CISource.gitlab(instanceID).contains(projectID: $0.key)
+        }
+        gitLabTimingPollAttempts = gitLabTimingPollAttempts.filter {
+            !CISource.gitlab(instanceID).contains(projectID: $0.key)
+        }
     }
 
     func saveGitHubToken(_ token: String) {
@@ -1177,7 +1187,7 @@ final class StackHubStore: ObservableObject {
                     lastGitHubFullDiscovery.map { Date().timeIntervalSince($0) > Self.githubFullDiscoveryInterval } ?? true
                 let discovered = try await profiler.measure("GitHub · 仓库索引", requests: 1) {
                     try await client.ownedProjects(
-                        limit: fullDiscovery ? Self.githubRepositoryLimit : 100,
+                        limit: Self.githubRepositoryLimit,
                         since: fullDiscovery ? nil : self.lastGitHubRepositorySync?.addingTimeInterval(-60)
                     )
                 }
@@ -1330,8 +1340,16 @@ final class StackHubStore: ObservableObject {
                     let runningCached = pipelines.values
                         .flatMap { $0 }
                         .filter { $0.provider == "GitLab CI" && $0.projectID.hasPrefix(instanceProjectPrefix) && $0.state == .running }
-                    for pipeline in runningCached {
+                    let runningToRefresh = runningCached.filter { pipeline in
+                        gitLabProjects.first(where: { $0.id == pipeline.projectID })?.isCIEnabled != false
+                    }.sorted { lhs, rhs in
+                        let left = gitLabRunningPollAttempts["\(lhs.projectID)|\(lhs.id)"] ?? .distantPast
+                        let right = gitLabRunningPollAttempts["\(rhs.projectID)|\(rhs.id)"] ?? .distantPast
+                        return left == right ? CIActivityOrdering.newestFirst(lhs, rhs) : left < right
+                    }.prefix(GitLabAPIClient.legacyFallbackProjectLimit)
+                    for pipeline in runningToRefresh {
                         guard gitLabProjects.first(where: { $0.id == pipeline.projectID })?.isCIEnabled != false else { continue }
+                        gitLabRunningPollAttempts["\(pipeline.projectID)|\(pipeline.id)"] = Date()
                         let pipelineID = pipeline.id.split(separator: "-").last.map(String.init) ?? pipeline.id
                         let refreshed = try await optionalCIRequest {
                             try await profiler.measure("\(instance.name) · 运行中流水线", requests: 1) {
@@ -1360,9 +1378,9 @@ final class StackHubStore: ObservableObject {
                 // the first batch even after they received a new push.
                 if forceProjectDiscovery || gitLabProjects.isEmpty {
                     let discovered = try await profiler.measure("\(instance.name) · 项目索引（兼容）", requests: 1) {
-                        try await client.accessibleProjects()
+                        try await client.recentlyActiveProjects()
                     }
-                    gitLabProjects = discovered.map {
+                    let recent = discovered.map {
                         CIAccessibleProject(
                             id: $0.id, name: $0.name, provider: $0.provider,
                             repository: $0.repository, branch: $0.branch,
@@ -1370,6 +1388,7 @@ final class StackHubStore: ObservableObject {
                             ciConfigurationCheckedAt: $0.isCIEnabled == nil ? nil : Date()
                         )
                     }
+                    gitLabProjects = CIActivityOrdering.uniqueProjects(recent + gitLabProjects)
                     didDiscover = true
                 } else {
                     do {
@@ -1475,7 +1494,10 @@ final class StackHubStore: ObservableObject {
             for remote in remotePipelines {
                 remotesByID["\(remote.projectID):\(remote.id)"] = remote
             }
-            remotePipelines = Array(remotesByID.values)
+            remotePipelines = remotesByID.values.sorted {
+                let left = $0.updatedAt ?? .distantPast, right = $1.updatedAt ?? .distantPast
+                return left == right ? $0.id < $1.id : left > right
+            }
 
             // New GitLab versions include `project` metadata in
             // the global feed. For older responses, resolve only
@@ -1483,10 +1505,22 @@ final class StackHubStore: ObservableObject {
             // project list.
             var projectsByID = Dictionary(uniqueKeysWithValues: gitLabProjects.map { ($0.id, $0) })
             var resolvedAllProjects = true
-            for remote in remotePipelines where projectsByID[remote.projectID] == nil {
+            var metadataRequests = Set<String>()
+            let metadataCandidates = remotePipelines.enumerated().sorted { lhs, rhs in
+                let left = gitLabProjectPollAttempts[lhs.element.projectID] ?? .distantPast
+                let right = gitLabProjectPollAttempts[rhs.element.projectID] ?? .distantPast
+                return left == right ? lhs.offset < rhs.offset : left < right
+            }.map(\.element)
+            for remote in metadataCandidates where projectsByID[remote.projectID] == nil {
                 if let project = self.makeGitLabProject(remote, instance: instance) {
                     projectsByID[project.id] = project
                 } else {
+                    guard metadataRequests.count < GitLabAPIClient.legacyFallbackProjectLimit,
+                          metadataRequests.insert(remote.projectID).inserted else {
+                        resolvedAllProjects = false
+                        continue
+                    }
+                    gitLabProjectPollAttempts[remote.projectID] = Date()
                     do {
                         let resolved = try await profiler.measure("\(instance.name) · 项目元数据", requests: 1) {
                             try await client.project(projectID: remote.projectID)
@@ -1536,12 +1570,21 @@ final class StackHubStore: ObservableObject {
             let followedProjectIDs = Set(self.ciProjects.compactMap { project in
                 source.contains(projectID: project.id) ? project.id : nil
             })
-            for projectID in followedProjectIDs {
+            let timingProjects = followedProjectIDs.sorted {
+                let left = gitLabTimingPollAttempts[$0] ?? .distantPast
+                let right = gitLabTimingPollAttempts[$1] ?? .distantPast
+                return left == right ? $0 < $1 : left < right
+            }
+            var timingRequests = 0
+            for projectID in timingProjects {
                 guard let project = projectsByID[projectID],
                       project.isCIEnabled != false,
                       let latest = pipelines[projectID]?.sorted(by: CIActivityOrdering.newestFirst).first,
                       latest.duration == "—",
                       latest.state != .running else { continue }
+                guard timingRequests < Self.timingPrefetchProjectLimit else { break }
+                timingRequests += 1
+                gitLabTimingPollAttempts[projectID] = Date()
                 let pipelineID = latest.id.split(separator: "-").last.map(String.init) ?? latest.id
                 let detailed = try await optionalCIRequest {
                     try await profiler.measure("\(instance.name) · 关注流水线详情（耗时）", requests: 1) {
@@ -1558,8 +1601,9 @@ final class StackHubStore: ObservableObject {
             // Retry missing cached details even after the global feed cursor
             // has advanced past a completed run. Keep each successful result
             // immediately if a later job request loses its connection.
+            let detailProjectIDs = Set(recentCIActivities.map(\.id)).union(followedProjectIDs)
             let stageCandidates = CIPipelineCache.stageRefreshCandidates(in: pipelines.filter {
-                projectsByID[$0.key]?.isCIEnabled != false
+                detailProjectIDs.contains($0.key) && projectsByID[$0.key]?.isCIEnabled != false
             })
             _ = try await prefetchPipelineStages(
                 candidates: stageCandidates,
@@ -1874,8 +1918,18 @@ final class StackHubStore: ObservableObject {
         ciProjects.contains { $0.id == projectID }
     }
 
+    var hasReachedCIFollowLimit: Bool { ciProjects.count >= Self.followedCIProjectLimit }
+
+    var ciFollowLimitMessage: String {
+        LF("最多关注 %ld 个项目，请先取消一个关注。", Self.followedCIProjectLimit)
+    }
+
     func followProject(_ projectID: String) {
         guard !isFollowing(projectID), let project = accessibleCIProjects.first(where: { $0.id == projectID }) else { return }
+        guard !hasReachedCIFollowLimit else {
+            toast = ciFollowLimitMessage
+            return
+        }
         ciProjects.append(CIMonitoredProject(id: project.id, name: project.name, provider: project.provider, repository: project.repository, branch: project.branch, instanceName: project.instanceName))
         selectedCIProjectID = project.id
         persistCIState()
@@ -2967,11 +3021,31 @@ struct CIView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            SectionLabel(title: "关注项目", trailing: "与本地项目独立")
+            HStack {
+                Text("关注项目").font(.subheadline.weight(.semibold))
+                Spacer()
+                Menu {
+                    // Include saved entries outside the recent list, so every
+                    // occupied slot can be freed without waiting for activity.
+                    ForEach(store.ciProjects) { project in
+                        Button(LF("取消关注 %@", project.name)) { store.unfollowProject(project.id) }
+                    }
+                } label: {
+                    Text("\(store.ciProjects.count) / \(StackHubStore.followedCIProjectLimit)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .disabled(store.ciProjects.isEmpty)
+                .help(L("管理关注项目"))
+                .accessibilityLabel(L("管理关注项目"))
+            }
+            .padding(.horizontal, 2)
             if store.visibleFollowedCIProjects.isEmpty {
                 EmptyStateCard(icon: "eye.slash", title: "还没有关注项目", detail: "在下方流水线列表中点击“关注项目”即可添加。")
             } else {
-                VStack(spacing: 8) {
+                LazyVStack(spacing: 8) {
                     ForEach(store.visibleFollowedCIProjects) { project in
                         CIProjectCard(
                             project: project,
@@ -2990,14 +3064,14 @@ struct CIView: View {
                 }
             }
             HStack(alignment: .firstTextBaseline) {
-                Text(L("全部流水线"))
+                Text(L("最近流水线"))
                     .font(.subheadline.weight(.semibold))
                 Spacer()
                 CIRefreshStatusButton()
             }
             .padding(.horizontal, 2)
             .padding(.top, 5)
-            Text("来自已连接账号触发的最近活动；关注项目后会在上方持续跟踪最近 5 条。")
+            Text("显示最近 20 个项目的流水线；关注项目会在上方保留最近 5 条。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 2)
@@ -3163,7 +3237,7 @@ struct CIActivityRow: View {
                 .buttonStyle(CIFollowButtonStyle(isFollowing: isFollowing))
                 .accessibilityLabel(isFollowing ? "取消关注项目" : "关注项目")
                 .accessibilityHint("点击切换关注状态")
-                .help(isFollowing ? "取消关注项目" : "关注项目")
+                .help(isFollowing ? L("取消关注项目") : (store.hasReachedCIFollowLimit ? store.ciFollowLimitMessage : L("关注项目")))
                 Button(L("查看"), action: onOpen)
                     .buttonStyle(StackSecondaryButtonStyle())
                     .controlSize(.small)
