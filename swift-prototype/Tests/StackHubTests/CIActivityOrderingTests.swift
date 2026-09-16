@@ -276,9 +276,9 @@ final class CIActivityOrderingTests: XCTestCase {
         let unreadFailure = pipeline("failed-new", project: repository, timestamp: 200, state: .failed)
         let running = pipeline("running", project: repository, timestamp: 300, state: .running)
 
-        let cache = [repository.id: [acknowledgedFailure, unreadFailure, running]]
+        let pipelines = [acknowledgedFailure, unreadFailure, running]
         let acknowledged = [CIPipelineStatusCounter.failureID(for: acknowledgedFailure)]
-        let counts = CIPipelineStatusCounter.counts(in: cache, acknowledgedFailureIDs: Set(acknowledged))
+        let counts = CIPipelineStatusCounter.counts(in: pipelines, acknowledgedFailureIDs: Set(acknowledged))
 
         XCTAssertEqual(counts.running, 1)
         XCTAssertEqual(counts.unreadFailures, 1)

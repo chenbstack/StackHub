@@ -120,19 +120,18 @@ enum CIPipelineStatusCounter {
         "\(pipeline.provider)|\(pipeline.projectID)|\(pipeline.id)"
     }
 
-    static func failedPipelineIDs(in cache: [String: [Pipeline]]) -> Set<String> {
-        Set(cache.values.lazy.flatMap { $0 }.compactMap { pipeline in
+    static func failedPipelineIDs(in pipelines: [Pipeline]) -> Set<String> {
+        Set(pipelines.compactMap { pipeline in
             pipeline.state == .failed ? failureID(for: pipeline) : nil
         })
     }
 
     static func counts(
-        in cache: [String: [Pipeline]],
+        in pipelines: [Pipeline],
         acknowledgedFailureIDs: Set<String>
     ) -> CIPipelineStatusCounts {
-        let pipelines = cache.values.lazy.flatMap { $0 }
         let running = pipelines.filter { $0.state == .running }.count
-        let failures = failedPipelineIDs(in: cache)
+        let failures = failedPipelineIDs(in: pipelines)
         return CIPipelineStatusCounts(
             running: running,
             unreadFailures: failures.subtracting(acknowledgedFailureIDs).count

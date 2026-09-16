@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 @MainActor
@@ -98,10 +99,16 @@ struct CIConnectionsSection: View {
     let onAddGitLab: () -> Void
     let onEditGitLab: (GitLabInstance) -> Void
     @State private var deletingInstance: GitLabInstance?
+    private let connectionTimer = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            SectionLabel(title: "CI 连接", trailing: "GitHub · GitLab")
+            HStack {
+                Text("CI 连接").font(.subheadline.weight(.semibold))
+                Spacer()
+                Button(L("检测全部")) { store.checkCIConnections() }
+                    .buttonStyle(StackSecondaryButtonStyle()).controlSize(.small)
+            }
             githubConnection
             gitLabConnections
         }
@@ -114,6 +121,9 @@ struct CIConnectionsSection: View {
         } message: {
             Text("该实例的 Token 和缓存流水线也会从本机移除。")
         }
+        .onAppear { store.setCIConnectionsVisible(true) }
+        .onDisappear { store.setCIConnectionsVisible(false) }
+        .onReceive(connectionTimer) { _ in store.checkCIConnectionsIfVisible() }
     }
 
     private var githubConnection: some View {
@@ -124,11 +134,11 @@ struct CIConnectionsSection: View {
                 .background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 9))
             VStack(alignment: .leading, spacing: 3) {
                 Text("GitHub 授权").font(.caption.weight(.semibold))
-                Text(L(store.isGitHubConnected ? "已连接，仓库和 Actions 可同步" : "尚未连接"))
-                    .font(.caption2).foregroundStyle(.secondary)
+                connectionLabel(.github)
             }
             Spacer()
-            Circle().fill(store.isGitHubConnected ? .green : .orange).frame(width: 8, height: 8)
+            connectionIndicator(.github)
+            connectionCheckButton(.github)
             Button(L(store.isGitHubConnected ? "管理" : "连接"), action: onManageGitHub)
                 .buttonStyle(StackSecondaryButtonStyle())
                 .controlSize(.small)
@@ -156,12 +166,14 @@ struct CIConnectionsSection: View {
                 VStack(spacing: 0) {
                     ForEach(store.instances) { instance in
                         HStack(spacing: 9) {
-                            Circle().fill(store.hasGitLabCredential(instance) ? .green : .orange).frame(width: 8, height: 8)
+                            connectionIndicator(.gitlab(instance.id))
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(instance.name).font(.caption.weight(.semibold))
                                 Text(instance.host).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                                connectionLabel(.gitlab(instance.id))
                             }
                             Spacer(minLength: 2)
+                            connectionCheckButton(.gitlab(instance.id))
                             Button { onEditGitLab(instance) } label: { Image(systemName: "pencil") }
                                 .buttonStyle(StackIconButtonStyle()).controlSize(.small)
                             Button { deletingInstance = instance } label: { Image(systemName: "trash") }
@@ -175,6 +187,46 @@ struct CIConnectionsSection: View {
                 .overlay(RoundedRectangle(cornerRadius: 14).stroke(.white.opacity(0.075)))
             }
         }
+    }
+
+    private func connectionColor(_ state: CIConnectionState) -> Color {
+        switch state {
+        case .connected: return .green
+        case .checking: return .blue
+        case .unauthorized, .forbidden: return .orange
+        case .unreachable, .failed: return .red
+        case .unchecked, .unconfigured: return .secondary
+        }
+    }
+
+    @ViewBuilder
+    private func connectionIndicator(_ source: CISource) -> some View {
+        let status = store.connectionStatus(for: source)
+        if status.state == .checking {
+            ProgressView().controlSize(.mini).frame(width: 10, height: 10)
+        } else {
+            Circle().fill(connectionColor(status.state)).frame(width: 8, height: 8)
+        }
+    }
+
+    private func connectionLabel(_ source: CISource) -> some View {
+        let status = store.connectionStatus(for: source)
+        let duration = status.duration.map { " · \(Int(($0 * 1_000).rounded())) ms" } ?? ""
+        let checked = status.checkedAt.map {
+            LF("检测于 %@", DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .medium))
+        }
+        return Text(status.state.label + duration)
+            .font(.caption2).foregroundStyle(connectionColor(status.state))
+            .fixedSize(horizontal: false, vertical: true)
+            .help([checked, status.detail].compactMap { $0 }.joined(separator: "\n"))
+    }
+
+    private func connectionCheckButton(_ source: CISource) -> some View {
+        Button { store.checkCIConnection(source) } label: { Image(systemName: "arrow.clockwise") }
+            .buttonStyle(StackIconButtonStyle()).controlSize(.small)
+            .disabled(store.connectionStatus(for: source).state == .checking)
+            .help(L("重新检测连接"))
+            .accessibilityLabel(L("重新检测连接"))
     }
 }
 

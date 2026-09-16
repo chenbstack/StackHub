@@ -84,6 +84,7 @@ final class StackHubAppDelegate: NSObject, NSApplicationDelegate {
         if panelWindow.isVisible {
             guard !PanelDismissalPolicy.isPresentingModal(panel: panelWindow, modalWindow: NSApp.modalWindow) else { return }
             panelWindow.orderOut(sender)
+            store.setPanelVisible(false)
             removePopoverDismissMonitors()
         } else {
             showPanel(panelWindow, below: button)
@@ -107,7 +108,7 @@ final class StackHubAppDelegate: NSObject, NSApplicationDelegate {
         panel.makeKeyAndOrderFront(nil)
         // The panel is reused, so reopening it does not fire SwiftUI onAppear.
         // Acknowledge unread failures on every successful presentation.
-        store.acknowledgeCIFailures()
+        store.setPanelVisible(true)
         updateStatusItem()
     }
 
@@ -117,6 +118,7 @@ final class StackHubAppDelegate: NSObject, NSApplicationDelegate {
             guard let self, let panel = self.panelWindow, panel.isVisible else { return event }
             if PanelDismissalPolicy.shouldDismiss(panel: panel, clickedWindow: event.window, modalWindow: NSApp.modalWindow) {
                 panel.orderOut(nil)
+                self.store.setPanelVisible(false)
                 self.removePopoverDismissMonitors()
             }
             return event
@@ -127,6 +129,7 @@ final class StackHubAppDelegate: NSObject, NSApplicationDelegate {
                       PanelDismissalPolicy.shouldDismiss(panel: panel, clickedWindow: nil, modalWindow: NSApp.modalWindow)
                 else { return }
                 panel.orderOut(nil)
+                self.store.setPanelVisible(false)
                 self.removePopoverDismissMonitors()
             }
         }
@@ -411,6 +414,9 @@ struct CIAccessibleProject: Identifiable, Codable {
     // Optional for decoding older indexes, which included collaborator/org
     // repositories and must be rediscovered before showing GitHub projects.
     var isOwnedByCurrentUser: Bool? = nil
+    // Optional for older caches and GitLab versions that omit these settings.
+    var isCIEnabled: Bool? = nil
+    var ciConfigurationCheckedAt: Date? = nil
 
     var isInRepositoryScope: Bool {
         provider != "GitHub Actions" || isOwnedByCurrentUser == true
@@ -628,6 +634,8 @@ final class StackHubStore: ObservableObject {
     /// opened. Persist this small acknowledgement set so a relaunch does not
     /// re-notify failures the user has already seen.
     @Published private(set) var acknowledgedFailedPipelineIDs: Set<String> = []
+    private var isPanelVisible = false
+    private var isCIActivityVisible = false
     @Published var selectedInstanceID: UUID?
     @Published var selectedCIProjectID: String?
     @Published var expandedStageID: String? = "test"
@@ -637,6 +645,10 @@ final class StackHubStore: ObservableObject {
     /// is deferred until an action actually needs a token.
     @Published private(set) var isGitHubConnected = false
     @Published private(set) var gitLabCredentialHosts: Set<String> = []
+    @Published private(set) var ciConnectionStatuses: [CISource: CIConnectionStatus] = [:]
+    private var ciConnectionCheckTasks: [CISource: Task<Void, Never>] = [:]
+    private var ciConnectionCheckIDs: [CISource: UUID] = [:]
+    private var isCIConnectionsVisible = false
     private var toastDismissTask: Task<Void, Never>?
     @Published var toast: String? {
         didSet {
@@ -719,22 +731,113 @@ final class StackHubStore: ObservableObject {
         CIActivityOrdering.latestActivities(projects: accessibleCIProjects, pipelineCache: pipelineCache)
     }
 
+    /// Match the latest run shown on each dashboard card. Historical failures
+    /// stay in the cache without creating a badge that has no matching card.
+    private var menuBarPipelines: [Pipeline] {
+        let activities = recentCIActivities.map(\.pipeline)
+        let activityProjectIDs = Set(activities.map(\.projectID))
+        let followed = visibleFollowedCIProjects
+            .filter { !activityProjectIDs.contains($0.id) }
+            .compactMap { recentPipelines(for: $0).first }
+        return activities + followed
+    }
+
     var menuBarPipelineStatus: CIPipelineStatusCounts {
         CIPipelineStatusCounter.counts(
-            in: pipelineCache,
+            in: menuBarPipelines,
             acknowledgedFailureIDs: acknowledgedFailedPipelineIDs
         )
     }
 
     func acknowledgeCIFailures() {
-        let failedIDs = CIPipelineStatusCounter.failedPipelineIDs(in: pipelineCache)
-        guard acknowledgedFailedPipelineIDs != failedIDs else { return }
-        acknowledgedFailedPipelineIDs = failedIDs
-        defaults.set(Array(failedIDs).sorted(), forKey: Self.acknowledgedFailedPipelineIDsKey)
+        let acknowledged = acknowledgedFailedPipelineIDs.union(
+            CIPipelineStatusCounter.failedPipelineIDs(in: menuBarPipelines)
+        )
+        guard acknowledgedFailedPipelineIDs != acknowledged else { return }
+        acknowledgedFailedPipelineIDs = acknowledged
+        defaults.set(Array(acknowledged).sorted(), forKey: Self.acknowledgedFailedPipelineIDsKey)
+    }
+
+    func setPanelVisible(_ visible: Bool) {
+        isPanelVisible = visible
+        if visible { acknowledgeCIFailures() }
+        if visible && isCIConnectionsVisible { checkCIConnections() }
+    }
+
+    func setCIActivityVisible(_ visible: Bool) {
+        // SwiftUI's view can stay mounted while the reusable NSPanel is hidden.
+        isCIActivityVisible = visible
+        if visible && isPanelVisible { acknowledgeCIFailures() }
     }
 
     func hasGitLabCredential(_ instance: GitLabInstance) -> Bool {
         gitLabCredentialHosts.contains(instance.host)
+    }
+
+    func connectionStatus(for source: CISource) -> CIConnectionStatus {
+        if let status = ciConnectionStatuses[source] { return status }
+        let configured: Bool
+        switch source {
+        case .github: configured = isGitHubConnected
+        case .gitlab(let id): configured = instances.first { $0.id == id }.map(hasGitLabCredential) ?? false
+        }
+        return CIConnectionStatus(state: configured ? .unchecked : .unconfigured)
+    }
+
+    func setCIConnectionsVisible(_ visible: Bool) {
+        isCIConnectionsVisible = visible
+        checkCIConnectionsIfVisible()
+    }
+
+    func checkCIConnectionsIfVisible() {
+        if isPanelVisible && isCIConnectionsVisible { checkCIConnections() }
+    }
+
+    func checkCIConnections() {
+        checkCIConnection(.github)
+        for instance in instances { checkCIConnection(.gitlab(instance.id)) }
+    }
+
+    func checkCIConnection(_ source: CISource) {
+        guard ciConnectionCheckIDs[source] == nil else { return }
+        if case .gitlab(let id) = source, !instances.contains(where: { $0.id == id }) { return }
+        let requestID = UUID()
+        ciConnectionCheckIDs[source] = requestID
+        ciConnectionStatuses[source] = CIConnectionStatus(state: .checking)
+        ciConnectionCheckTasks[source] = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let startedAt = Date()
+            let result: CIConnectionStatus
+            do {
+                switch source {
+                case .github:
+                    guard let token = await self.githubAccessTokenForRequest(), !token.isEmpty else {
+                        throw CIIntegrationError.missingToken
+                    }
+                    try Task.checkCancellation()
+                    try await GitHubAPIClient(token: token, session: self.ciSession).checkConnection()
+                case .gitlab(let id):
+                    guard let instance = self.instances.first(where: { $0.id == id }),
+                          let token = self.gitLabToken(for: instance), !token.isEmpty else {
+                        throw CIIntegrationError.missingToken
+                    }
+                    try await GitLabAPIClient(instanceURL: instance.host, token: token, session: self.ciSession).checkConnection()
+                }
+                result = CIConnectionStatus(state: .connected, checkedAt: Date(), duration: Date().timeIntervalSince(startedAt))
+            } catch {
+                result = CIConnectionStatus.failure(error)
+            }
+            guard self.ciConnectionCheckIDs[source] == requestID, !Task.isCancelled else { return }
+            self.ciConnectionStatuses[source] = result
+            self.ciConnectionCheckIDs.removeValue(forKey: source)
+            self.ciConnectionCheckTasks.removeValue(forKey: source)
+        }
+    }
+
+    func invalidateCIConnectionCheck(_ source: CISource) {
+        ciConnectionCheckTasks.removeValue(forKey: source)?.cancel()
+        ciConnectionCheckIDs.removeValue(forKey: source)
+        ciConnectionStatuses.removeValue(forKey: source)
     }
 
     private func loadCredentialMetadata() {
@@ -837,9 +940,15 @@ final class StackHubStore: ObservableObject {
     }
 
     private func reconcileAcknowledgedFailures() {
-        acknowledgedFailedPipelineIDs.formIntersection(
-            CIPipelineStatusCounter.failedPipelineIDs(in: pipelineCache)
+        var acknowledged = acknowledgedFailedPipelineIDs.intersection(
+            CIPipelineStatusCounter.failedPipelineIDs(in: pipelineCache.values.flatMap { $0 })
         )
+        if isPanelVisible && isCIActivityVisible {
+            acknowledged.formUnion(CIPipelineStatusCounter.failedPipelineIDs(in: menuBarPipelines))
+        }
+        if acknowledged != acknowledgedFailedPipelineIDs {
+            acknowledgedFailedPipelineIDs = acknowledged
+        }
     }
 
     private func clearGitLabRefreshState(for instanceID: UUID) {
@@ -869,6 +978,7 @@ final class StackHubStore: ObservableObject {
             isGitHubConnected = true
             defaults.set(true, forKey: Self.githubConnectedMetadataKey)
             invalidateGitHubProjectIndex()
+            checkCIConnection(.github)
             // The settings page reflects the connected state. Avoid a
             // persistent success toast in the menu-bar footer.
             toast = nil
@@ -901,7 +1011,10 @@ final class StackHubStore: ObservableObject {
             }
             isGitHubConnected = true
             defaults.set(true, forKey: Self.githubConnectedMetadataKey)
-            if resetProjectIndex { invalidateGitHubProjectIndex() }
+            if resetProjectIndex {
+                invalidateGitHubProjectIndex()
+                checkCIConnection(.github)
+            }
             // The settings page reflects the connected state. Avoid a
             // persistent success toast in the menu-bar footer.
             toast = nil
@@ -967,7 +1080,7 @@ final class StackHubStore: ObservableObject {
         }
         for instance in instances {
             startCIRefresh(source: .gitlab(instance.id), manual: manual) { requestID in
-                await self.refreshGitLab(instance, requestID: requestID, forceProjectDiscovery: forceProjectDiscovery)
+                await self.refreshGitLab(instance, requestID: requestID, forceProjectDiscovery: forceProjectDiscovery, recheckDisabledProjects: manual)
             }
         }
     }
@@ -985,6 +1098,7 @@ final class StackHubStore: ObservableObject {
     }
 
     private func invalidateCIRefresh(_ source: CISource) {
+        invalidateCIConnectionCheck(source)
         ciRefreshTasks.removeValue(forKey: source)?.cancel()
         ciRefreshScheduler.invalidate(source)
         offlineCISources.remove(source)
@@ -1158,7 +1272,7 @@ final class StackHubStore: ObservableObject {
         }
     }
 
-    private func refreshGitLab(_ instance: GitLabInstance, requestID: UUID, forceProjectDiscovery: Bool) async {
+    private func refreshGitLab(_ instance: GitLabInstance, requestID: UUID, forceProjectDiscovery: Bool, recheckDisabledProjects: Bool) async {
         let source = CISource.gitlab(instance.id)
         let cachedProjects = accessibleCIProjects.filter { source.contains(projectID: $0.id) }
         var projects: [CIAccessibleProject] = []
@@ -1182,6 +1296,17 @@ final class StackHubStore: ObservableObject {
             var advancesPipelineCursor = false
             var remotePipelines: [RemotePipeline] = []
 
+            func refreshCIConfiguration(for project: CIAccessibleProject) async throws -> Bool? {
+                let resolved = try await profiler.measure("\(instance.name) · CI 配置", requests: 1) {
+                    try await client.project(projectID: project.id)
+                }
+                if let index = gitLabProjects.firstIndex(where: { $0.id == project.id }) {
+                    gitLabProjects[index].isCIEnabled = resolved.isCIEnabled
+                    gitLabProjects[index].ciConfigurationCheckedAt = Date()
+                }
+                return resolved.isCIEnabled
+            }
+
             if globalCapability != false {
                 do {
                     // GitLab has a cross-project pipeline feed, so the
@@ -1203,6 +1328,7 @@ final class StackHubStore: ObservableObject {
                         .flatMap { $0 }
                         .filter { $0.provider == "GitLab CI" && $0.projectID.hasPrefix(instanceProjectPrefix) && $0.state == .running }
                     for pipeline in runningCached {
+                        guard gitLabProjects.first(where: { $0.id == pipeline.projectID })?.isCIEnabled != false else { continue }
                         let pipelineID = pipeline.id.split(separator: "-").last.map(String.init) ?? pipeline.id
                         let refreshed = try await optionalCIRequest {
                             try await profiler.measure("\(instance.name) · 运行中流水线", requests: 1) {
@@ -1239,14 +1365,29 @@ final class StackHubStore: ObservableObject {
                         CIAccessibleProject(
                             id: $0.id, name: $0.name, provider: $0.provider,
                             repository: $0.repository, branch: $0.branch,
-                            instanceName: instance.name
+                            instanceName: instance.name, isCIEnabled: $0.isCIEnabled,
+                            ciConfigurationCheckedAt: $0.isCIEnabled == nil ? nil : Date()
                         )
                     }
                     didDiscover = true
                 }
-                let fallbackProjects = Array(gitLabProjects.prefix(GitLabAPIClient.legacyFallbackProjectLimit))
+                let fallbackProjects = Array(gitLabProjects.filter { project in
+                    if project.isCIEnabled == false, let checkedAt = project.ciConfigurationCheckedAt,
+                       checkedAt >= syncStartedAt { return false }
+                    return project.isCIEnabled != false || recheckDisabledProjects || forceProjectDiscovery ||
+                        project.ciConfigurationCheckedAt.map { Date().timeIntervalSince($0) >= 300 } != false
+                }.prefix(GitLabAPIClient.legacyFallbackProjectLimit))
                 for project in fallbackProjects {
                     try Task.checkCancellation()
+                    if project.isCIEnabled == false {
+                        do {
+                            if try await refreshCIConfiguration(for: project) == false { continue }
+                        } catch {
+                            if CIConnectionFailure.shouldStopRequests(error) { throw error }
+                            errors.append("\(instance.name) \(project.repository)：\(error.localizedDescription)")
+                            continue
+                        }
+                    }
                     let projectSyncKey = "\(syncKey):\(project.id)"
                     let cachedCursor = pipelines[project.id]?.compactMap(\.updatedAt).max()
                     let cursor = forceProjectDiscovery ? nil : (projectSyncDates[projectSyncKey] ?? cachedCursor)
@@ -1263,6 +1404,17 @@ final class StackHubStore: ObservableObject {
                         // Advance only after a successful response;
                         // a failed request remains eligible next time.
                         projectSyncDates[projectSyncKey] = syncStartedAt
+                    } catch let error as CIIntegrationError {
+                        if case .http(403, _) = error {
+                            // Disabled CI/CD also returns 403. Confirm via project
+                            // metadata; a genuine permission error must stay visible.
+                            do {
+                                if try await refreshCIConfiguration(for: project) == false { continue }
+                            } catch {
+                                if CIConnectionFailure.shouldStopRequests(error) { throw error }
+                            }
+                        }
+                        errors.append("\(instance.name) \(project.repository)：\(error.localizedDescription)")
                     } catch {
                         if CIConnectionFailure.shouldStopRequests(error) { throw error }
                         errors.append("\(instance.name) \(project.repository)：\(error.localizedDescription)")
@@ -1296,7 +1448,8 @@ final class StackHubStore: ObservableObject {
                         projectsByID[remote.projectID] = CIAccessibleProject(
                             id: remote.projectID, name: resolved.name, provider: resolved.provider,
                             repository: resolved.repository, branch: resolved.branch,
-                            instanceName: instance.name
+                            instanceName: instance.name, isCIEnabled: resolved.isCIEnabled,
+                            ciConfigurationCheckedAt: resolved.isCIEnabled == nil ? nil : Date()
                         )
                     } catch {
                         resolvedAllProjects = false
@@ -1339,6 +1492,7 @@ final class StackHubStore: ObservableObject {
             })
             for projectID in followedProjectIDs {
                 guard let project = projectsByID[projectID],
+                      project.isCIEnabled != false,
                       let latest = pipelines[projectID]?.sorted(by: CIActivityOrdering.newestFirst).first,
                       latest.duration == "—",
                       latest.state != .running else { continue }
@@ -1358,7 +1512,9 @@ final class StackHubStore: ObservableObject {
             // Retry missing cached details even after the global feed cursor
             // has advanced past a completed run. Keep each successful result
             // immediately if a later job request loses its connection.
-            let stageCandidates = CIPipelineCache.stageRefreshCandidates(in: pipelines)
+            let stageCandidates = CIPipelineCache.stageRefreshCandidates(in: pipelines.filter {
+                projectsByID[$0.key]?.isCIEnabled != false
+            })
             _ = try await prefetchPipelineStages(
                 candidates: stageCandidates,
                 limit: Self.stagePrefetchProjectLimit,
@@ -1406,6 +1562,7 @@ final class StackHubStore: ObservableObject {
               pipeline.duration == "—",
               pipeline.state != .running,
               let project = accessibleCIProjects.first(where: { $0.id == pipeline.projectID }),
+              project.isCIEnabled != false,
               let instance = instances.first(where: {
                   pipeline.projectID.hasPrefix("gitlab:\($0.id.uuidString):")
               }),
@@ -1984,6 +2141,7 @@ final class StackHubStore: ObservableObject {
         gitLabCredentialHosts.insert(instance.host)
         gitLabTokenCache[instance.host] = trimmedToken
         instances.append(instance)
+        checkCIConnection(.gitlab(instance.id))
         persistCIState()
         selectedInstanceID = instance.id
         toast = "GitLab 实例已添加"
@@ -2042,6 +2200,7 @@ final class StackHubStore: ObservableObject {
         }
         invalidateCIRefresh(.gitlab(instance.id))
         instances[index] = GitLabInstance(id: instance.id, name: resolvedName, host: resolvedHost, project: project.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? instance.project : project, isConnected: hasTokenAfterSave)
+        checkCIConnection(.gitlab(instance.id))
         persistCIState()
         toast = "已保存 GitLab 实例"
         return true
@@ -2144,9 +2303,6 @@ struct StackHubPanel: View {
             set: { appUpdater.driver.failure = $0 }
         )) { failure in
             Alert(title: Text(L("更新失败")), message: Text(failure.message), dismissButton: .default(Text(L("好"))))
-        }
-        .onChange(of: store.tab) { _, tab in
-            if tab == .ci { store.acknowledgeCIFailures() }
         }
     }
 
@@ -2822,9 +2978,10 @@ struct CIView: View {
             }
         }
         .onAppear {
-            store.acknowledgeCIFailures()
+            store.setCIActivityVisible(true)
             store.refreshCIIfNeeded()
         }
+        .onDisappear { store.setCIActivityVisible(false) }
         .onReceive(refreshTimer) { _ in store.refreshCIIfNeeded() }
     }
 }
@@ -2852,7 +3009,7 @@ private struct CIRefreshStatusButton: View {
 
     private func updateAge(at date: Date) -> String {
         if store.isRefreshingCI { return L("刷新中") }
-        if store.ciError != nil { return L("部分连接失败") }
+        if store.ciError != nil { return L("部分同步失败") }
         guard let lastRefresh = store.lastCIRefresh else { return L("尚未更新") }
         let elapsedSeconds = max(0, Int(date.timeIntervalSince(lastRefresh)))
         if elapsedSeconds < 60 { return LF("%ld 秒前", elapsedSeconds) }

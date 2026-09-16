@@ -265,3 +265,14 @@
 "好" = "OK";
 
 "部分连接失败" = "Some connections failed";
+"部分同步失败" = "Some syncs failed";
+"尚未检测" = "Not checked";
+"检测中…" = "Checking…";
+"连接正常" = "Connected";
+"认证失败，请重新授权" = "Authentication failed. Sign in again.";
+"访问被拒绝，请检查权限" = "Access denied. Check permissions.";
+"无法连接" = "Unreachable";
+"检测失败" = "Check failed";
+"检测全部" = "Check all";
+"重新检测连接" = "Check connection again";
+"检测于 %@" = "Checked at %@";

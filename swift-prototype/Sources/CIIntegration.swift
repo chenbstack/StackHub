@@ -126,6 +126,7 @@ struct RemoteProject: Identifiable, Decodable {
     let provider: String
     let instanceName: String?
     let updatedAt: Date?
+    var isCIEnabled: Bool? = nil
 }
 
 struct RemotePipeline: Identifiable, Decodable {
@@ -183,6 +184,10 @@ final class GitHubAPIClient {
         self.session = session
         self.decoder = JSONDecoder()
         self.decoder.dateDecodingStrategy = .iso8601
+    }
+
+    func checkConnection() async throws {
+        let _: CIAuthenticatedUser = try await send(makeURL(path: "/user"), cachePolicy: .reloadIgnoringLocalCacheData)
     }
 
     /// Returns only the most recently updated repositories owned by the
@@ -285,8 +290,8 @@ final class GitHubAPIClient {
         return url
     }
 
-    private func send<T: Decodable>(_ url: URL) async throws -> T {
-        var request = URLRequest(url: url, timeoutInterval: CIHTTPTransport.timeout)
+    private func send<T: Decodable>(_ url: URL, cachePolicy: URLRequest.CachePolicy = .useProtocolCachePolicy) async throws -> T {
+        var request = URLRequest(url: url, cachePolicy: cachePolicy, timeoutInterval: CIHTTPTransport.timeout)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
@@ -397,6 +402,10 @@ final class GitLabAPIClient {
         self.projectIDPrefix = projectIDPrefix
     }
 
+    func checkConnection() async throws {
+        let _: CIAuthenticatedUser = try await send(makeURL(path: "/api/v4/user"), cachePolicy: .reloadIgnoringLocalCacheData)
+    }
+
     func accessibleProjects() async throws -> [RemoteProject] {
         var response: [GitLabProject] = []
         for page in 1...10 {
@@ -410,10 +419,8 @@ final class GitLabAPIClient {
             response.append(contentsOf: batch)
             if batch.count < 100 { break }
         }
-        return response.map {
-            let prefix = projectIDPrefix ?? baseURL.host ?? "instance"
-            return RemoteProject(id: "gitlab:\(prefix):\($0.id)", name: $0.name, repository: $0.pathWithNamespace, branch: $0.defaultBranch ?? "main", provider: "GitLab CI", instanceName: baseURL.host, updatedAt: nil)
-        }
+        let prefix = projectIDPrefix ?? baseURL.host ?? "instance"
+        return response.map { makeRemoteProject($0, prefix: prefix) }
     }
 
     /// GitLab 的全局流水线活动接口。它一次返回多个项目的近期流水线，
@@ -513,7 +520,8 @@ final class GitLabAPIClient {
         RemoteProject(
             id: "gitlab:\(prefix):\(project.id)", name: project.name,
             repository: project.pathWithNamespace, branch: project.defaultBranch ?? "main",
-            provider: "GitLab CI", instanceName: baseURL.host, updatedAt: nil
+            provider: "GitLab CI", instanceName: baseURL.host, updatedAt: nil,
+            isCIEnabled: project.isCIEnabled
         )
     }
 
@@ -526,8 +534,8 @@ final class GitLabAPIClient {
         return url
     }
 
-    private func send<T: Decodable>(_ url: URL) async throws -> T {
-        var request = URLRequest(url: url, timeoutInterval: CIHTTPTransport.timeout)
+    private func send<T: Decodable>(_ url: URL, cachePolicy: URLRequest.CachePolicy = .useProtocolCachePolicy) async throws -> T {
+        var request = URLRequest(url: url, cachePolicy: cachePolicy, timeoutInterval: CIHTTPTransport.timeout)
         request.setValue(token, forHTTPHeaderField: "PRIVATE-TOKEN")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         let (data, response) = try await session.data(for: request)
@@ -542,11 +550,21 @@ private struct GitLabProject: Decodable {
     let name: String
     let pathWithNamespace: String
     let defaultBranch: String?
+    let buildsAccessLevel: String?
+    let jobsEnabled: Bool?
+
+    var isCIEnabled: Bool? {
+        if buildsAccessLevel == "disabled" || jobsEnabled == false { return false }
+        if buildsAccessLevel != nil || jobsEnabled == true { return true }
+        return nil
+    }
 
     enum CodingKeys: String, CodingKey {
         case id, name
         case pathWithNamespace = "path_with_namespace"
         case defaultBranch = "default_branch"
+        case buildsAccessLevel = "builds_access_level"
+        case jobsEnabled = "jobs_enabled"
     }
 }
 
