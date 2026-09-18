@@ -199,7 +199,7 @@
 "没有可添加的项目；下方列表中的项目都已关注。" = "There are no projects to add; every project in the list below is already followed.";
 "关注" = "Follow";
 "最近流水线" = "Recent pipelines";
-"显示最近 20 个项目的流水线；关注项目会在上方保留最近 5 条。" = "Latest pipelines from 20 projects. Followed projects keep their latest five runs above.";
+"显示最近 20 条流水线；关注项目会在上方保留最近 5 条。" = "Latest 20 pipeline runs. Followed projects keep their latest five runs above.";
 "正在同步流水线" = "Syncing pipelines";
 "先连接 CI 账号" = "Connect a CI account first";
 "打开 CI 页面后会自动加载你有权限查看的项目和流水线。" = "Opening the CI page automatically loads projects and pipelines that you can access.";

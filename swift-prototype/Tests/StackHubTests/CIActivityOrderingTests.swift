@@ -54,6 +54,38 @@ final class CIActivityOrderingTests: XCTestCase {
         XCTAssertEqual(cache.count, 100)
     }
 
+    func testRecentActivityListKeepsRepeatedRunsFromTheSameProject() {
+        let repeated = project("gitlab:one:1", provider: "GitLab CI")
+        let other = project("github:owner/other")
+        let cache = [
+            repeated.id: [
+                pipeline("old", project: repeated, timestamp: 100),
+                pipeline("new", project: repeated, timestamp: 300)
+            ],
+            other.id: [pipeline("middle", project: other, timestamp: 200)]
+        ]
+
+        let result = CIActivityOrdering.recentActivities(
+            projects: [repeated, other], pipelineCache: cache
+        )
+
+        XCTAssertEqual(result.map(\.pipeline.id), ["new", "middle", "old"])
+        XCTAssertEqual(result.map(\.id), [repeated.id, other.id, repeated.id])
+    }
+
+    func testRecentActivityListAppliesRunLimitAfterSorting() {
+        let repository = project("github:owner/project")
+        let runs = (1...4).map {
+            pipeline("run-\($0)", project: repository, timestamp: Double($0))
+        }
+
+        let result = CIActivityOrdering.recentActivities(
+            projects: [repository], pipelineCache: [repository.id: runs], limit: 2
+        )
+
+        XCTAssertEqual(result.map(\.pipeline.id), ["run-4", "run-3"])
+    }
+
     func testExecutionDurationFormattingIsCompactAndProviderIndependent() {
         withAppLanguage(.simplifiedChinese) {
         XCTAssertEqual(CIExecutionTimeFormatter.duration(seconds: 0), "0 秒")

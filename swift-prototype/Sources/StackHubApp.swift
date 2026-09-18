@@ -734,13 +734,18 @@ final class StackHubStore: ObservableObject {
     }
 
     var recentCIActivities: [CIProjectActivity] {
-        CIActivityOrdering.latestActivities(projects: accessibleCIProjects, pipelineCache: pipelineCache)
+        CIActivityOrdering.recentActivities(projects: accessibleCIProjects, pipelineCache: pipelineCache)
     }
 
     /// Match the latest run shown on each dashboard card. Historical failures
     /// stay in the cache without creating a badge that has no matching card.
     private var menuBarPipelines: [Pipeline] {
-        let activities = recentCIActivities.map(\.pipeline)
+        // Menu-bar counts represent the latest run for each project, even
+        // though the dashboard feed also shows recent historical runs.
+        let activities = CIActivityOrdering.latestActivities(
+            projects: accessibleCIProjects,
+            pipelineCache: pipelineCache
+        ).map(\.pipeline)
         let activityProjectIDs = Set(activities.map(\.projectID))
         let followed = visibleFollowedCIProjects
             .filter { !activityProjectIDs.contains($0.id) }
@@ -3147,12 +3152,12 @@ struct CIView: View {
             }
             .padding(.horizontal, 2)
             .padding(.top, 5)
-            Text("显示最近 20 个项目的流水线；关注项目会在上方保留最近 5 条。")
+            Text("显示最近 20 条流水线；关注项目会在上方保留最近 5 条。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 2)
             LazyVStack(spacing: 8) {
-                ForEach(store.recentCIActivities) { activity in
+                ForEach(store.recentCIActivities, id: \.activityID) { activity in
                     CIActivityRow(
                         project: activity.project,
                         pipeline: activity.pipeline,

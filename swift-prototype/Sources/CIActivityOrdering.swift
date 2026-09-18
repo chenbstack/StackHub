@@ -1,11 +1,12 @@
 import Foundation
 
-/// One latest pipeline per project, preserving the existing activity-card layout.
+/// A project and one of its pipeline runs used by activity cards.
 struct CIProjectActivity: Identifiable {
     let project: CIAccessibleProject
     let pipeline: Pipeline
 
     var id: String { project.id }
+    var activityID: String { "\(project.id)|\(pipeline.id)" }
 }
 
 enum CIActivityOrdering {
@@ -39,6 +40,33 @@ enum CIActivityOrdering {
             }
             return newestFirst(lhs.pipeline, rhs.pipeline)
         }.prefix(activityDisplayLimit).map { $0 }
+    }
+
+    /// Build the dashboard feed from individual runs rather than collapsing
+    /// each project to its newest run. The cache keeps a small history per
+    /// project, so repeated runs from one repository remain visible alongside
+    /// runs from other repositories.
+    static func recentActivities(
+        projects: [CIAccessibleProject],
+        pipelineCache: [String: [Pipeline]],
+        limit: Int = activityDisplayLimit
+    ) -> [CIProjectActivity] {
+        let projectByID = Dictionary(uniqueKeysWithValues: uniqueProjects(projects).map { ($0.id, $0) })
+        return pipelineCache
+            .flatMap { (projectID: String, pipelines: [Pipeline]) -> [CIProjectActivity] in
+                guard let project = projectByID[projectID] else { return [] }
+                return pipelines.map { CIProjectActivity(project: project, pipeline: $0) }
+            }
+            .sorted { lhs, rhs in
+                if lhs.pipeline.updatedAt == rhs.pipeline.updatedAt {
+                    let left = "\(lhs.project.id)|\(lhs.pipeline.id)"
+                    let right = "\(rhs.project.id)|\(rhs.pipeline.id)"
+                    return left < right
+                }
+                return newestFirst(lhs.pipeline, rhs.pipeline)
+            }
+            .prefix(max(limit, 0))
+            .map { $0 }
     }
 
     /// Keep the API's recently-active repository order for bounded requests.
